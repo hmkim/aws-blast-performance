@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'BLAST Performance Test - EFS Storage with NT Database'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: blast-perf-test
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-efs-nt-db
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !ImportValue 
+        Fn::Sub: ${ProjectName}-private-subnet-1
+      SecurityGroups:
+        - !ImportValue 
+            Fn::Sub: ${ProjectName}-efs-sg-id
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !ImportValue 
+        Fn::Sub: ${ProjectName}-private-subnet-2
+      SecurityGroups:
+        - !ImportValue 
+            Fn::Sub: ${ProjectName}-efs-sg-id
+
+  DBUploadInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - arn:aws:s3:::ncbi-blast-databases/*
+                  - arn:aws:s3:::ncbi-blast-databases
+
+  DBUploadInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DBUploadInstanceRole
+
+  DBUploadInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - EFSMountTarget1
+      - EFSMountTarget2
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: r5d.24xlarge
+      IamInstanceProfile: !Ref DBUploadInstanceProfile
+      SubnetId: !ImportValue 
+        Fn::Sub: ${ProjectName}-private-subnet-1
+      SecurityGroupIds:
+        - !ImportValue 
+            Fn::Sub: ${ProjectName}-batch-sg-id
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # CloudWatch Logs 설정
+          yum install -y amazon-cloudwatch-agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<'EOF'
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/nt-download.log",
+                      "log_group_name": "/blast-perf-test/efs/nt-download",
+                      "log_stream_name": "{instance_id}"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+          
+          # EFS 마운트
+          yum install -y amazon-efs-utils
+          mkdir -p /mnt/efs
+          mount -t efs -o tls ${EFSFileSystem}:/ /mnt/efs
+          echo "${EFSFileSystem}:/ /mnt/efs efs _netdev,tls 0 0" >> /etc/fstab
+          
+          # NT 데이터베이스 다운로드
+          mkdir -p /mnt/efs/nt
+          cd /mnt/efs/nt
+          
+          exec > >(tee -a /var/log/nt-download.log) 2>&1
+          echo "$(date): Starting NT database download"
+          
+          # nt-nucl-metadata.json 다운로드
+          aws s3 cp s3://ncbi-blast-databases/nt-nucl-metadata.json .
+          
+          # NT 파일 다운로드 및 압축 해제
+          for file in $(aws s3 ls s3://ncbi-blast-databases/ | grep "nt\." | awk '{print $4}'); do
+            echo "$(date): Downloading $file"
+            aws s3 cp s3://ncbi-blast-databases/$file .
+            
+            if [[ $file == *.tar.gz ]]; then
+              echo "$(date): Extracting $file"
+              tar -xzf $file
+              rm $file
+            fi
+          done
+          
+          # taxdb 다운로드
+          echo "$(date): Downloading taxdb"
+          aws s3 cp s3://ncbi-blast-databases/taxdb.tar.gz .
+          tar -xzf taxdb.tar.gz
+          rm taxdb.tar.gz
+          
+          echo "$(date): NT database download completed"
+          df -h /mnt/efs
+          du -sh /mnt/efs/nt
+          
+          # 완료 신호
+          aws ssm put-parameter \
+            --name "/blast-perf-test/efs/download-status" \
+            --value "completed" \
+            --type String \
+            --overwrite \
+            --region ${AWS::Region} || true
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-efs-db-upload
+
+Outputs:
+  EFSFileSystemId:
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub ${ProjectName}-efs-id
+
+  DBUploadInstanceId:
+    Value: !Ref DBUploadInstance
+    Description: Instance ID for NT database upload to EFS

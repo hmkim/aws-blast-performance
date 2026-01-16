@@ -1,0 +1,455 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'BLAST Performance Test - AWS Batch Environment for 3 Scenarios'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: blast-perf-test
+
+  QueryS3Bucket:
+    Type: String
+    Description: S3 bucket for query files and results
+
+  QueryS3Key:
+    Type: String
+    Default: queries/query.fasta
+    Description: S3 key for query file
+
+  LustreFileSystemId:
+    Type: String
+    Description: FSx for Lustre file system ID
+
+  LustreMountName:
+    Type: String
+    Description: FSx for Lustre mount name
+
+Resources:
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+
+  BatchInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${QueryS3Bucket}/*
+                  - !Sub arn:aws:s3:::${QueryS3Bucket}
+                  - arn:aws:s3:::ncbi-blast-databases/*
+                  - arn:aws:s3:::ncbi-blast-databases
+
+  BatchInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BatchInstanceRole
+
+  BatchJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${QueryS3Bucket}/*
+                  - !Sub arn:aws:s3:::${QueryS3Bucket}
+                  - arn:aws:s3:::ncbi-blast-databases/*
+                  - arn:aws:s3:::ncbi-blast-databases
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Scenario 1: EFS
+  ComputeEnvironmentEFS:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        MaxvCpus: 384
+        DesiredvCpus: 0
+        InstanceTypes:
+          - optimal
+        Subnets:
+          - !ImportValue 
+              Fn::Sub: ${ProjectName}-private-subnet-1
+          - !ImportValue 
+              Fn::Sub: ${ProjectName}-private-subnet-2
+        SecurityGroupIds:
+          - !ImportValue 
+              Fn::Sub: ${ProjectName}-batch-sg-id
+        InstanceRole: !GetAtt BatchInstanceProfile.Arn
+        Tags:
+          Name: !Sub ${ProjectName}-efs-compute
+
+  JobQueueEFS:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref ComputeEnvironmentEFS
+
+  JobDefinitionEFS:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      JobDefinitionName: !Sub ${ProjectName}-blastn-efs
+      PlatformCapabilities:
+        - EC2
+      ContainerProperties:
+        Image: ncbi/blast:latest
+        Vcpus: 32
+        Memory: 768000
+        JobRoleArn: !GetAtt BatchJobRole.Arn
+        Command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+            START_TIME=$(date +%s)
+            echo "Job started at $(date)"
+            
+            # 쿼리 다운로드
+            aws s3 cp s3://Ref::QueryS3Bucket/Ref::QueryS3Key /tmp/query.fasta
+            
+            # BLASTN 실행
+            blastn \
+              -db /mnt/efs/nt/nt \
+              -query /tmp/query.fasta \
+              -num_threads 32 \
+              -evalue 1.0E-3 \
+              -max_target_seqs 5 \
+              -outfmt '6 qseqid qstart qend qcovs qcovhsp qcovus sseqid stitle sstart send evalue bitscore nident pident mismatch gaps sstrand staxids sscinames' \
+              -out /tmp/results.out
+            
+            # 결과 업로드
+            aws s3 cp /tmp/results.out s3://Ref::QueryS3Bucket/results/efs/results-$(date +%Y%m%d-%H%M%S).out
+            
+            END_TIME=$(date +%s)
+            DURATION=$((END_TIME - START_TIME))
+            echo "Job completed at $(date)"
+            echo "Total duration: ${DURATION} seconds"
+        MountPoints:
+          - SourceVolume: efs
+            ContainerPath: /mnt/efs
+            ReadOnly: true
+        Volumes:
+          - Name: efs
+            EfsVolumeConfiguration:
+              FileSystemId: !ImportValue 
+                Fn::Sub: ${ProjectName}-efs-id
+              TransitEncryption: ENABLED
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref LogGroupEFS
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: blast
+
+  LogGroupEFS:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /blast-perf-test/batch/efs
+      RetentionInDays: 7
+
+  # Scenario 2: Lustre
+  ComputeEnvironmentLustre:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        MaxvCpus: 384
+        DesiredvCpus: 0
+        InstanceTypes:
+          - optimal
+        Subnets:
+          - !ImportValue 
+              Fn::Sub: ${ProjectName}-private-subnet-1
+          - !ImportValue 
+              Fn::Sub: ${ProjectName}-private-subnet-2
+        SecurityGroupIds:
+          - !ImportValue 
+              Fn::Sub: ${ProjectName}-batch-sg-id
+        InstanceRole: !GetAtt BatchInstanceProfile.Arn
+        LaunchTemplate:
+          LaunchTemplateId: !Ref LustreLaunchTemplate
+        Tags:
+          Name: !Sub ${ProjectName}-lustre-compute
+
+  LustreLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        UserData:
+          Fn::Base64: !Sub |
+            MIME-Version: 1.0
+            Content-Type: multipart/mixed; boundary="==MYBOUNDARY=="
+
+            --==MYBOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+
+            #!/bin/bash
+            yum install -y lustre-client
+            mkdir -p /mnt/lustre
+            mount -t lustre ${LustreFileSystemId}.fsx.${AWS::Region}.amazonaws.com@tcp:/${LustreMountName} /mnt/lustre
+
+            --==MYBOUNDARY==--
+
+  JobQueueLustre:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref ComputeEnvironmentLustre
+
+  JobDefinitionLustre:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      JobDefinitionName: !Sub ${ProjectName}-blastn-lustre
+      PlatformCapabilities:
+        - EC2
+      ContainerProperties:
+        Image: ncbi/blast:latest
+        Vcpus: 32
+        Memory: 768000
+        JobRoleArn: !GetAtt BatchJobRole.Arn
+        Privileged: true
+        Command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+            START_TIME=$(date +%s)
+            echo "Job started at $(date)"
+            
+            # 쿼리 다운로드
+            aws s3 cp s3://Ref::QueryS3Bucket/Ref::QueryS3Key /tmp/query.fasta
+            
+            # BLASTN 실행
+            blastn \
+              -db /mnt/lustre/nt/nt \
+              -query /tmp/query.fasta \
+              -num_threads 32 \
+              -evalue 1.0E-3 \
+              -max_target_seqs 5 \
+              -outfmt '6 qseqid qstart qend qcovs qcovhsp qcovus sseqid stitle sstart send evalue bitscore nident pident mismatch gaps sstrand staxids sscinames' \
+              -out /tmp/results.out
+            
+            # 결과 업로드
+            aws s3 cp /tmp/results.out s3://Ref::QueryS3Bucket/results/lustre/results-$(date +%Y%m%d-%H%M%S).out
+            
+            END_TIME=$(date +%s)
+            DURATION=$((END_TIME - START_TIME))
+            echo "Job completed at $(date)"
+            echo "Total duration: ${DURATION} seconds"
+        MountPoints:
+          - SourceVolume: lustre
+            ContainerPath: /mnt/lustre
+            ReadOnly: true
+        Volumes:
+          - Name: lustre
+            Host:
+              SourcePath: /mnt/lustre
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref LogGroupLustre
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: blast
+
+  LogGroupLustre:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /blast-perf-test/batch/lustre
+      RetentionInDays: 7
+
+  # Scenario 3: S3 Download (baseline)
+  ComputeEnvironmentS3:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        MaxvCpus: 384
+        DesiredvCpus: 0
+        InstanceTypes:
+          - optimal
+        Subnets:
+          - !ImportValue 
+              Fn::Sub: ${ProjectName}-private-subnet-1
+          - !ImportValue 
+              Fn::Sub: ${ProjectName}-private-subnet-2
+        SecurityGroupIds:
+          - !ImportValue 
+              Fn::Sub: ${ProjectName}-batch-sg-id
+        InstanceRole: !GetAtt BatchInstanceProfile.Arn
+        Tags:
+          Name: !Sub ${ProjectName}-s3-compute
+
+  JobQueueS3:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref ComputeEnvironmentS3
+
+  JobDefinitionS3:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      JobDefinitionName: !Sub ${ProjectName}-blastn-s3
+      PlatformCapabilities:
+        - EC2
+      ContainerProperties:
+        Image: ncbi/blast:latest
+        Vcpus: 32
+        Memory: 768000
+        JobRoleArn: !GetAtt BatchJobRole.Arn
+        Command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+            START_TIME=$(date +%s)
+            echo "Job started at $(date)"
+            
+            # NT DB 다운로드
+            DB_START=$(date +%s)
+            mkdir -p /mnt/nvme/nt
+            cd /mnt/nvme/nt
+            
+            aws s3 sync s3://ncbi-blast-databases/ . \
+              --exclude "*" \
+              --include "nt.*" \
+              --include "nt-nucl-metadata.json" \
+              --include "taxdb.tar.gz"
+            
+            for file in *.tar.gz; do
+              tar -xzf "$file" && rm "$file"
+            done
+            
+            DB_END=$(date +%s)
+            DB_DURATION=$((DB_END - DB_START))
+            echo "DB download duration: ${DB_DURATION} seconds"
+            
+            # 쿼리 다운로드
+            aws s3 cp s3://Ref::QueryS3Bucket/Ref::QueryS3Key /tmp/query.fasta
+            
+            # BLASTN 실행
+            BLAST_START=$(date +%s)
+            blastn \
+              -db /mnt/nvme/nt/nt \
+              -query /tmp/query.fasta \
+              -num_threads 32 \
+              -evalue 1.0E-3 \
+              -max_target_seqs 5 \
+              -outfmt '6 qseqid qstart qend qcovs qcovhsp qcovus sseqid stitle sstart send evalue bitscore nident pident mismatch gaps sstrand staxids sscinames' \
+              -out /tmp/results.out
+            BLAST_END=$(date +%s)
+            BLAST_DURATION=$((BLAST_END - BLAST_START))
+            echo "BLAST execution duration: ${BLAST_DURATION} seconds"
+            
+            # 결과 업로드
+            aws s3 cp /tmp/results.out s3://Ref::QueryS3Bucket/results/s3/results-$(date +%Y%m%d-%H%M%S).out
+            
+            END_TIME=$(date +%s)
+            DURATION=$((END_TIME - START_TIME))
+            echo "Job completed at $(date)"
+            echo "Total duration: ${DURATION} seconds"
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref LogGroupS3
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: blast
+
+  LogGroupS3:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /blast-perf-test/batch/s3
+      RetentionInDays: 7
+
+Outputs:
+  JobQueueEFSArn:
+    Value: !Ref JobQueueEFS
+    Export:
+      Name: !Sub ${ProjectName}-job-queue-efs
+
+  JobQueueLustreArn:
+    Value: !Ref JobQueueLustre
+    Export:
+      Name: !Sub ${ProjectName}-job-queue-lustre
+
+  JobQueueS3Arn:
+    Value: !Ref JobQueueS3
+    Export:
+      Name: !Sub ${ProjectName}-job-queue-s3
+
+  JobDefinitionEFS:
+    Value: !Ref JobDefinitionEFS
+
+  JobDefinitionLustre:
+    Value: !Ref JobDefinitionLustre
+
+  JobDefinitionS3:
+    Value: !Ref JobDefinitionS3

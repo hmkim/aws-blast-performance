@@ -1,0 +1,54 @@
+# Logs
+*.log
+
+# AWS credentials
+.aws/
+*.pem
+*.key
+
+# Environment variables
+.env
+.env.local
+
+# CloudFormation outputs
+outputs/
+*.json
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Query results
+results/
+*.out
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+env/
+
+# Data files (large)
+data/*.fasta
+data/*.fa
+data/*.fastq
+data/*.bam
+data/*.vcf
+
+# Backup files
+*.bak
+*.backup

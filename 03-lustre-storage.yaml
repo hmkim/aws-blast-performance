@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'BLAST Performance Test - FSx for Lustre Storage with S3 Integration'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: blast-perf-test
+
+  S3BucketName:
+    Type: String
+    Description: S3 bucket name for Lustre data repository (must be unique)
+    Default: blast-nt-db-lustre
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${S3BucketName}-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LustreFileSystem:
+    Type: AWS::FSx::FileSystem
+    Properties:
+      FileSystemType: LUSTRE
+      StorageCapacity: 1200
+      SubnetIds:
+        - !ImportValue 
+            Fn::Sub: ${ProjectName}-private-subnet-1
+      SecurityGroupIds:
+        - !ImportValue 
+            Fn::Sub: ${ProjectName}-lustre-sg-id
+      LustreConfiguration:
+        DeploymentType: SCRATCH_2
+        ImportPath: !Sub s3://${S3Bucket}/nt/
+        ExportPath: !Sub s3://${S3Bucket}/nt-export/
+        ImportedFileChunkSize: 1024
+        DataCompressionType: NONE
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-lustre-nt-db
+
+  DBCopyInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub ${S3Bucket.Arn}/*
+                  - !GetAtt S3Bucket.Arn
+                  - arn:aws:s3:::ncbi-blast-databases/*
+                  - arn:aws:s3:::ncbi-blast-databases
+
+  DBCopyInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref DBCopyInstanceRole
+
+  DBCopyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: r5d.24xlarge
+      IamInstanceProfile: !Ref DBCopyInstanceProfile
+      SubnetId: !ImportValue 
+        Fn::Sub: ${ProjectName}-private-subnet-1
+      SecurityGroupIds:
+        - !ImportValue 
+            Fn::Sub: ${ProjectName}-batch-sg-id
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # CloudWatch Logs 설정
+          yum install -y amazon-cloudwatch-agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<'EOF'
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/nt-s3-copy.log",
+                      "log_group_name": "/blast-perf-test/lustre/nt-s3-copy",
+                      "log_stream_name": "{instance_id}"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+          
+          exec > >(tee -a /var/log/nt-s3-copy.log) 2>&1
+          echo "$(date): Starting NT database copy to S3"
+          
+          # NCBI S3에서 자신의 S3로 복사
+          aws s3 sync s3://ncbi-blast-databases/ s3://${S3Bucket}/nt/ \
+            --exclude "*" \
+            --include "nt.*" \
+            --include "nt-nucl-metadata.json" \
+            --include "taxdb.tar.gz" \
+            --region ${AWS::Region}
+          
+          echo "$(date): NT database copy to S3 completed"
+          aws s3 ls s3://${S3Bucket}/nt/ --recursive --human-readable --summarize
+          
+          # 완료 신호
+          aws ssm put-parameter \
+            --name "/blast-perf-test/lustre/s3-copy-status" \
+            --value "completed" \
+            --type String \
+            --overwrite \
+            --region ${AWS::Region} || true
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-lustre-db-copy
+
+Outputs:
+  LustreFileSystemId:
+    Value: !Ref LustreFileSystem
+    Export:
+      Name: !Sub ${ProjectName}-lustre-id
+
+  LustreMountName:
+    Value: !GetAtt LustreFileSystem.LustreMountName
+    Export:
+      Name: !Sub ${ProjectName}-lustre-mount-name
+
+  S3BucketName:
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub ${ProjectName}-lustre-s3-bucket
+
+  DBCopyInstanceId:
+    Value: !Ref DBCopyInstance
+    Description: Instance ID for NT database copy to S3
