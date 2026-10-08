@@ -154,7 +154,7 @@ services are priced, and per day because that is how long you should keep them.
 |---|---|---|---|
 | EFS Standard storage | $0.30 /GB-mo | $360 /mo | $12 |
 | EFS Elastic throughput writes (staging, once) | $0.06 /GB | **$72 one-time** | - |
-| EFS Elastic throughput reads | $0.03 /GB | **$35 per cold pass** | - |
+| EFS Elastic throughput reads | $0.03 /GB | **$35 per cold pass** (rate confirmed by billing, see below) | - |
 | FSx for Lustre SCRATCH_2 2,400 GiB | $0.14 /GB-mo | $336 /mo | $11 |
 | S3 Standard (your DB copy) | $0.023 /GB-mo | $28 /mo | $0.9 |
 | S3 copy from NCBI, same region | $0 transfer, requests negligible | $0 | - |
@@ -168,6 +168,23 @@ One complete round (deploy, stage, three jobs, tear down inside 24 h) is roughly
 of which EFS staging writes + two EFS cold passes are about $140. Leaving everything up costs
 about **$760 per month** plus any staging instance you forget to stop (the templates now stop them
 automatically; the original r5d.24xlarge staging hosts would have cost $5,000 per month each).
+
+### What an earlier round actually cost
+
+A round run with the previous templates (December 2025 to February 2026, infrastructure in two
+regions) was billed about **$1,680**, read from Cost Explorer by the `Name` tag:
+
+| Item | Billed | Note |
+|---|---|---|
+| Two r5d.24xlarge staging hosts | ~$1,050 (62%) | one of them ran for five days straight; this is why the templates now use m6i and shut down |
+| EFS storage + reads | ~$260 | one month held 2.8 TB of Elastic-throughput reads billed $85, i.e. $0.03/GB and about 2.4 cold passes over nt |
+| FSx for Lustre 1,200 GiB SCRATCH_2 | ~$180 | about four weeks, including $41 of regional data transfer |
+| NAT gateways (two regions) | ~$170 | hourly charge for about eight weeks; 530 GB processed in the first month before the S3 gateway endpoint existed |
+| Batch compute (r6i.24xlarge) | ~$22 | |
+
+Only the EFS read rate above is a billed figure; everything else in this section is a list-price
+projection. The staging hosts cost more than the measurement itself, which is the point of
+shutting them down.
 
 ## What was verified (2026-10-08)
 
