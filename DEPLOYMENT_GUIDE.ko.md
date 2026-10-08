@@ -68,7 +68,7 @@ QUICKSTART 4단계 참조. `QueryS3Key` 기본값은 `queries/query.fasta`. 결�
 ### 5. 실행과 결과 읽기
 
 ```bash
-./run_tests.sh                    # 또는 ./run_tests.sh efs
+./run_tests.sh                    # 또는 ./run_tests.sh efs, ./run_tests.sh --concurrency 4 (큐당 N잡 동시 제출; MaxvCpus=384이면 최대 8)
 ./analyze_performance.py --region $AWS_REGION --project $PROJECT_NAME [--run <timestamp>] [--json out.json]
 ```
 

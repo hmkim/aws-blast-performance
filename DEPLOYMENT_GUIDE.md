@@ -85,7 +85,7 @@ See QUICKSTART step 4. `QueryS3Key` defaults to `queries/query.fasta`. Results l
 ### 5. Run and read the results
 
 ```bash
-./run_tests.sh                    # or ./run_tests.sh efs
+./run_tests.sh                    # or ./run_tests.sh efs, or ./run_tests.sh --concurrency 4 (N jobs per queue; <= 8 with MaxvCpus=384)
 ./analyze_performance.py --region $AWS_REGION --project $PROJECT_NAME [--run <timestamp>] [--json out.json]
 ```
 

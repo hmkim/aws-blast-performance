@@ -75,6 +75,7 @@ Optional overrides: `InstanceTypes=r6id.12xlarge,r5d.12xlarge` `JobVcpus=48` `Jo
 ```bash
 ./run_tests.sh              # all three; refuses to start until both staging signals read "completed"
 ./run_tests.sh lustre s3    # subset
+./run_tests.sh --concurrency 4   # 4 jobs per queue at once (up to 8 fit MaxvCpus=384); see README "Concurrency"
 ```
 
 ## 6. Monitor and analyze
@@ -82,7 +83,7 @@ Optional overrides: `InstanceTypes=r6id.12xlarge,r5d.12xlarge` `JobVcpus=48` `Jo
 ```bash
 aws batch describe-jobs --jobs <JOB_ID ...> --region $AWS_REGION --query 'jobs[].{name:jobName,status:status,reason:statusReason}' --output table
 aws logs tail /${PROJECT_NAME}/batch/efs    --follow --region $AWS_REGION   # also .../lustre and .../s3
-./analyze_performance.py --region $AWS_REGION --project $PROJECT_NAME
+./analyze_performance.py --region $AWS_REGION --project $PROJECT_NAME [--run <timestamp>]   # p50/p95 + aggregate MB/s per scenario
 ```
 
 ## 7. Cleanup

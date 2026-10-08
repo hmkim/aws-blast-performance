@@ -144,6 +144,40 @@ Actual `blastn` time is the larger of this storage floor and the CPU time for yo
 For a DB that fits in RAM (core_nt, 272 GB on a 384 GiB node) the warm pass is identical across
 scenarios and only `db_setup` + the first cold pass differ.
 
+## Concurrency: how the storage layer behaves when N nodes read at once
+
+One job per scenario measures a single reader. The question that decides between a shared file
+system and per-instance NVMe is what happens when several instances scan the same copy at the same
+time: EFS caps each client at 1,500 MiB/s but the file system itself scales; FSx for Lustre
+aggregate throughput is fixed by the provisioned size (about 470 MB/s baseline for 2,400 GiB SCRATCH_2,
+however many clients read); NVMe scales linearly because every instance has its own copy, but every
+new instance pays the download first.
+
+```bash
+./run_tests.sh --concurrency 4            # 4 identical jobs per queue, submitted in the same second
+./analyze_performance.py --region $AWS_REGION --project $PROJECT_NAME --run <timestamp printed above>
+```
+
+`analyze_performance.py` then prints, per scenario, the job count, **p50/p95 of job wall time**
+(`total_seconds`) and of the cold pass, and the **aggregate cold-pass throughput**
+`MB/s = DB bytes x jobs / window`, where the window runs from the first job's cold-pass start to the
+last job's cold-pass end (CloudWatch timestamps of the `db_setup` and `pass=1` METRIC lines). DB bytes
+are taken from the `s3` job's `db_bytes` metric, or from `--db-gb` (default 1170, nt bytes-to-cache).
+`--run <timestamp>` selects exactly the jobs of one submission via `.runs.log`.
+
+Limits to know before raising N:
+
+- Each job requests `JobVcpus` (48) and `JobMemoryMiB` (370,000), i.e. one whole 12xlarge, so N
+  concurrent jobs mean N instances per scenario. The three compute environments are created with
+  `MaxvCpus: 384`, which allows **up to 8 concurrent 48-vCPU jobs per queue** (24 with the small-DB
+  variant's `JobVcpus=16`); jobs beyond that wait in `RUNNABLE`. Raise `MaxvCpus` in
+  `04-batch-environment.yaml` only if you need more than 8.
+- Your EC2 On-Demand vCPU quota for R instances must cover 48 x N per scenario (144 x N for all three).
+- In the `s3` scenario every one of the N instances downloads its own copy of the DB, so the
+  `.done` reuse never triggers inside one concurrent wave; it only pays off for later jobs landing on
+  an instance that is still alive. Per-scenario cost grows linearly with N (about $3.6/h per
+  instance); for EFS add $35 of reads per job and cold pass over nt.
+
 ## Cost
 
 List prices, us-east-1, read from the AWS Price List API on 2026-10-08. The benchmark should be run
@@ -216,8 +250,8 @@ us-east-1 and ap-northeast-2; on-demand us-east-1 $3.6288 / $3.4560 / $7.2576 / 
 ├── 02-efs-storage.yaml              EFS + staging host (BlastDbName, StagingInstanceType)
 ├── 03-lustre-storage.yaml           S3 bucket + FSx for Lustre + S3->S3 copy host (LustreStorageCapacity)
 ├── 04-batch-environment.yaml        3 compute environments / queues / job definitions (InstanceTypes, JobVcpus, ...)
-├── run_tests.sh                     submit one job per scenario (checks staging status first)
-├── analyze_performance.py           parse METRIC lines -> comparison table / JSON
+├── run_tests.sh                     submit one job per scenario, or N with --concurrency N (checks staging status first)
+├── analyze_performance.py           parse METRIC lines -> comparison table, p50/p95 + aggregate MB/s, JSON
 ├── cleanup.sh                       delete everything in reverse order
 ├── DEPLOYMENT_GUIDE.md / .ko.md     step-by-step guide and troubleshooting (English / Korean)
 └── QUICKSTART.md
@@ -226,7 +260,7 @@ us-east-1 and ap-northeast-2; on-demand us-east-1 $3.6288 / $3.4560 / $7.2576 / 
 ## Requirements
 
 - AWS CLI v2, an account with CloudFormation/EC2/EFS/FSx/Batch/IAM permissions
-- EC2 On-Demand vCPU quota for R instances >= 48 per concurrent scenario (144 to run all three at once)
+- EC2 On-Demand vCPU quota for R instances >= 48 per concurrent job (144 to run all three scenarios at once, x N with `--concurrency N`)
 - A query FASTA uploaded to `s3://<query-bucket>/queries/query.fasta`
 - Python 3 + boto3 for `analyze_performance.py`
 
