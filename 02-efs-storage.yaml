@@ -1,10 +1,27 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'BLAST Performance Test - EFS Storage with NT Database'
+Description: 'BLAST Performance Test - EFS Storage with NCBI BLAST DB (staged once from s3://ncbi-blast-databases)'
 
 Parameters:
   ProjectName:
     Type: String
     Default: blast-perf-test
+
+  BlastDbName:
+    Type: String
+    Default: nt
+    Description: >-
+      NCBI BLAST database to stage (as listed by `update_blastdb.pl --showall --source aws`).
+      nt is ~1.2 TB (390 volumes, 3,454 files, 2026-09). Use a small DB such as
+      ref_viruses_rep_genomes (~150 MB) or 16S_ribosomal_RNA (~20 MB) to smoke-test the
+      pipeline before committing to nt.
+
+  StagingInstanceType:
+    Type: String
+    Default: m6i.4xlarge
+    Description: >-
+      Instance that copies the DB from S3 into EFS. The copy is network/EFS-write bound
+      (single NFS client: up to 1,500 MiB/s with efs-utils 2.x on Elastic throughput),
+      so a 96-vCPU instance brings nothing. m6i.4xlarge (12.5 Gbit/s) is sufficient.
 
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
@@ -19,7 +36,7 @@ Resources:
       ThroughputMode: elastic
       FileSystemTags:
         - Key: Name
-          Value: !Sub ${ProjectName}-efs-nt-db
+          Value: !Sub ${ProjectName}-efs-${BlastDbName}-db
 
   EFSMountTarget1:
     Type: AWS::EFS::MountTarget
@@ -41,6 +58,12 @@ Resources:
         - !ImportValue 
             Fn::Sub: ${ProjectName}-efs-sg-id
 
+  StagingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/efs/db-staging
+      RetentionInDays: 14
+
   DBUploadInstanceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -55,7 +78,7 @@ Resources:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
         - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
       Policies:
-        - PolicyName: S3Access
+        - PolicyName: S3ReadNcbiBlastDb
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -66,6 +89,14 @@ Resources:
                 Resource:
                   - arn:aws:s3:::ncbi-blast-databases/*
                   - arn:aws:s3:::ncbi-blast-databases
+        - PolicyName: SsmStatusParameter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*
 
   DBUploadInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -78,9 +109,10 @@ Resources:
     DependsOn:
       - EFSMountTarget1
       - EFSMountTarget2
+      - StagingLogGroup
     Properties:
       ImageId: !Ref LatestAmiId
-      InstanceType: r5d.24xlarge
+      InstanceType: !Ref StagingInstanceType
       IamInstanceProfile: !Ref DBUploadInstanceProfile
       SubnetId: !ImportValue 
         Fn::Sub: ${ProjectName}-private-subnet-1
@@ -90,16 +122,18 @@ Resources:
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
-            VolumeSize: 100
+            VolumeSize: 30
             VolumeType: gp3
             Encrypted: true
+      # NOTE: this block is an Fn::Sub template. Shell variables are written as $VAR or
+      # ${!VAR} (escaped) so that CloudFormation does not try to substitute them.
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          set -e
-          
-          # CloudWatch Logs 설정
-          yum install -y amazon-cloudwatch-agent
+          set -euo pipefail
+
+          # CloudWatch Logs
+          dnf install -y amazon-cloudwatch-agent amazon-efs-utils
           cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<'EOF'
           {
             "logs": {
@@ -107,8 +141,8 @@ Resources:
                 "files": {
                   "collect_list": [
                     {
-                      "file_path": "/var/log/nt-download.log",
-                      "log_group_name": "/blast-perf-test/efs/nt-download",
+                      "file_path": "/var/log/db-staging.log",
+                      "log_group_name": "/${ProjectName}/efs/db-staging",
                       "log_stream_name": "{instance_id}"
                     }
                   ]
@@ -120,56 +154,54 @@ Resources:
           /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
             -a fetch-config -m ec2 -s \
             -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
-          
-          # EFS 마운트
-          yum install -y amazon-efs-utils
+
+          exec > >(tee -a /var/log/db-staging.log) 2>&1
+
+          # Mount EFS
           mkdir -p /mnt/efs
           mount -t efs -o tls ${EFSFileSystem}:/ /mnt/efs
           echo "${EFSFileSystem}:/ /mnt/efs efs _netdev,tls 0 0" >> /etc/fstab
-          
-          # NT 데이터베이스 다운로드
-          mkdir -p /mnt/efs/nt
-          cd /mnt/efs/nt
-          
-          exec > >(tee -a /var/log/nt-download.log) 2>&1
-          echo "$(date): Starting NT database download"
-          
-          # nt-nucl-metadata.json 다운로드
-          aws s3 cp s3://ncbi-blast-databases/nt-nucl-metadata.json .
-          
-          # NT 파일 다운로드 및 압축 해제
-          for file in $(aws s3 ls s3://ncbi-blast-databases/ | grep "nt\." | awk '{print $4}'); do
-            echo "$(date): Downloading $file"
-            aws s3 cp s3://ncbi-blast-databases/$file .
-            
-            if [[ $file == *.tar.gz ]]; then
-              echo "$(date): Extracting $file"
-              tar -xzf $file
-              rm $file
-            fi
-          done
-          
-          # taxdb 다운로드
-          echo "$(date): Downloading taxdb"
-          aws s3 cp s3://ncbi-blast-databases/taxdb.tar.gz .
-          tar -xzf taxdb.tar.gz
-          rm taxdb.tar.gz
-          
-          echo "$(date): NT database download completed"
+
+          DB=${BlastDbName}
+          DEST=/mnt/efs/$DB
+          mkdir -p $DEST
+
+          # The NCBI bucket stores UNPACKED volume files (no tar.gz) under a dated prefix.
+          # The current prefix is published in s3://ncbi-blast-databases/latest-dir.
+          LATEST=$(aws s3 cp s3://ncbi-blast-databases/latest-dir - --region us-east-1)
+          SRC=s3://ncbi-blast-databases/$LATEST/
+          echo "$(date -u +%FT%TZ) staging $DB from $SRC to $DEST"
+
+          # Parallel copy. aws-cli defaults (10 concurrent requests) under-utilise the link.
+          aws configure set default.s3.max_concurrent_requests 32
+          aws configure set default.s3.max_queue_size 10000
+          T0=$(date +%s)
+          aws s3 sync $SRC $DEST \
+            --region us-east-1 --only-show-errors \
+            --exclude "*" \
+            --include "$DB.*" \
+            --include "$DB-nucl-metadata.json" \
+            --include "taxdb.*"
+          T1=$(date +%s)
+          echo "$(date -u +%FT%TZ) copy finished in $((T1 - T0)) seconds"
+          echo "$LATEST" > $DEST/SOURCE_PREFIX
+          du -sh $DEST
           df -h /mnt/efs
-          du -sh /mnt/efs/nt
-          
-          # 완료 신호
+
+          echo "$(date -u +%FT%TZ) staging completed"
           aws ssm put-parameter \
-            --name "/blast-perf-test/efs/download-status" \
-            --value "completed" \
-            --type String \
-            --overwrite \
-            --region ${AWS::Region} || true
+            --name "/${ProjectName}/efs/db-staging-status" \
+            --value "completed:$DB:$LATEST:$((T1 - T0))s" \
+            --type String --overwrite --region ${AWS::Region} || true
+
+          # Cost guard: this instance has no further purpose. Give the CloudWatch agent
+          # time to flush, then stop (not terminate - the stack still owns it).
+          sleep 60
+          shutdown -h now
 
       Tags:
         - Key: Name
-          Value: !Sub ${ProjectName}-efs-db-upload
+          Value: !Sub ${ProjectName}-efs-db-staging
 
 Outputs:
   EFSFileSystemId:
@@ -179,4 +211,8 @@ Outputs:
 
   DBUploadInstanceId:
     Value: !Ref DBUploadInstance
-    Description: Instance ID for NT database upload to EFS
+    Description: Staging instance (stop or terminate it once the SSM parameter <ProjectName>/efs/db-staging-status reads completed)
+
+  StagedDbPath:
+    Value: !Sub /mnt/efs/${BlastDbName}/${BlastDbName}
+    Description: -db argument for blastn when the EFS file system is mounted at /mnt/efs

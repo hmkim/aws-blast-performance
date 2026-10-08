@@ -143,6 +143,19 @@ Resources:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable
 
+  # S3 traffic (NCBI BLAST DB bucket, query/result bucket, Lustre data repository)
+  # bypasses the NAT Gateway. Without this endpoint every 1.2 TB DB pull is billed
+  # as NAT data processing (~$0.045/GB -> ~$54 per pull). Gateway endpoints are free.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+        - !Ref PublicRouteTable
+
   BatchSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:

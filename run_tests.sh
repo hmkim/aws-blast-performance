@@ -1,114 +1,55 @@
 #!/bin/bash
-set -e
+# Submit one BLAST job per storage scenario (or only the scenarios given as arguments).
+#   ./run_tests.sh              # efs lustre s3
+#   ./run_tests.sh lustre s3    # subset
+set -euo pipefail
 
 PROJECT_NAME="${PROJECT_NAME:-blast-perf-test}"
-REGION="${REGION:-us-east-1}"
+REGION="${REGION:-${AWS_REGION:-us-east-1}}"
+SCENARIOS=("$@")
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(efs lustre s3)
 
 echo "=========================================="
-echo "BLAST Performance Test Execution"
+echo "BLAST Storage Performance Test"
+echo "project=$PROJECT_NAME region=$REGION scenarios=${SCENARIOS[*]}"
 echo "=========================================="
 
-# Get Job Queue and Definition
-echo "Retrieving Job Queue and Definition..."
+stack_output() {
+  aws cloudformation describe-stacks --stack-name "${PROJECT_NAME}-batch" --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+}
 
-JOB_QUEUE_EFS=$(aws cloudformation describe-stacks \
-  --stack-name ${PROJECT_NAME}-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobQueueEFSArn`].OutputValue' \
-  --output text \
-  --region $REGION)
-
-JOB_DEF_EFS=$(aws cloudformation describe-stacks \
-  --stack-name ${PROJECT_NAME}-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobDefinitionEFS`].OutputValue' \
-  --output text \
-  --region $REGION)
-
-JOB_QUEUE_LUSTRE=$(aws cloudformation describe-stacks \
-  --stack-name ${PROJECT_NAME}-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobQueueLustreArn`].OutputValue' \
-  --output text \
-  --region $REGION)
-
-JOB_DEF_LUSTRE=$(aws cloudformation describe-stacks \
-  --stack-name ${PROJECT_NAME}-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobDefinitionLustre`].OutputValue' \
-  --output text \
-  --region $REGION)
-
-JOB_QUEUE_S3=$(aws cloudformation describe-stacks \
-  --stack-name ${PROJECT_NAME}-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobQueueS3Arn`].OutputValue' \
-  --output text \
-  --region $REGION)
-
-JOB_DEF_S3=$(aws cloudformation describe-stacks \
-  --stack-name ${PROJECT_NAME}-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobDefinitionS3`].OutputValue' \
-  --output text \
-  --region $REGION)
+# Refuse to run before the DBs are staged (both stacks write an SSM parameter when done).
+staging_status() {
+  aws ssm get-parameter --name "$1" --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || echo "missing"
+}
+for s in "${SCENARIOS[@]}"; do
+  case $s in
+    efs)    st=$(staging_status "/${PROJECT_NAME}/efs/db-staging-status") ;;
+    lustre|s3) st=$(staging_status "/${PROJECT_NAME}/lustre/db-s3-copy-status") ;;
+    *) echo "unknown scenario: $s" >&2; exit 1 ;;
+  esac
+  echo "staging status for $s: $st"
+  case $st in completed*) ;; *) echo "DB for scenario '$s' is not staged yet - aborting" >&2; exit 1 ;; esac
+done
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+declare -A JOB_IDS
+for s in "${SCENARIOS[@]}"; do
+  case $s in
+    efs)    Q=$(stack_output JobQueueEFSArn);    D=$(stack_output JobDefinitionEFS) ;;
+    lustre) Q=$(stack_output JobQueueLustreArn); D=$(stack_output JobDefinitionLustre) ;;
+    s3)     Q=$(stack_output JobQueueS3Arn);     D=$(stack_output JobDefinitionS3) ;;
+  esac
+  JOB_IDS[$s]=$(aws batch submit-job \
+    --job-name "blast-${s}-${TIMESTAMP}" \
+    --job-queue "$Q" --job-definition "$D" \
+    --tags "project=${PROJECT_NAME},scenario=${s},run=${TIMESTAMP}" \
+    --region "$REGION" --query 'jobId' --output text)
+  echo "submitted $s -> ${JOB_IDS[$s]}   logs: aws logs tail /${PROJECT_NAME}/batch/${s} --follow --region $REGION"
+done
 
-# Scenario 1: EFS
-echo -e "\n[1/3] Running EFS scenario..."
-JOB_ID_EFS=$(aws batch submit-job \
-  --job-name blast-efs-test-$TIMESTAMP \
-  --job-queue $JOB_QUEUE_EFS \
-  --job-definition $JOB_DEF_EFS \
-  --region $REGION \
-  --query 'jobId' \
-  --output text)
-
-echo "✓ EFS job submitted (Job ID: $JOB_ID_EFS)"
-echo "  Logs: aws logs tail /blast-perf-test/batch/efs --follow --region $REGION"
-
-# Scenario 2: Lustre
-echo -e "\n[2/3] Running Lustre scenario..."
-JOB_ID_LUSTRE=$(aws batch submit-job \
-  --job-name blast-lustre-test-$TIMESTAMP \
-  --job-queue $JOB_QUEUE_LUSTRE \
-  --job-definition $JOB_DEF_LUSTRE \
-  --region $REGION \
-  --query 'jobId' \
-  --output text)
-
-echo "✓ Lustre job submitted (Job ID: $JOB_ID_LUSTRE)"
-echo "  Logs: aws logs tail /blast-perf-test/batch/lustre --follow --region $REGION"
-
-# Scenario 3: S3
-echo -e "\n[3/3] Running S3 scenario..."
-JOB_ID_S3=$(aws batch submit-job \
-  --job-name blast-s3-test-$TIMESTAMP \
-  --job-queue $JOB_QUEUE_S3 \
-  --job-definition $JOB_DEF_S3 \
-  --region $REGION \
-  --query 'jobId' \
-  --output text)
-
-echo "✓ S3 job submitted (Job ID: $JOB_ID_S3)"
-echo "  Logs: aws logs tail /blast-perf-test/batch/s3 --follow --region $REGION"
-
-echo -e "\n=========================================="
-echo "All jobs submitted"
-echo "=========================================="
-echo ""
-echo "Job IDs:"
-echo "  EFS:    $JOB_ID_EFS"
-echo "  Lustre: $JOB_ID_LUSTRE"
-echo "  S3:     $JOB_ID_S3"
-echo ""
-echo "Check job status:"
-echo "  aws batch describe-jobs --jobs $JOB_ID_EFS $JOB_ID_LUSTRE $JOB_ID_S3 --region $REGION"
-echo ""
-echo "Monitor logs:"
-echo "  # EFS"
-echo "  aws logs tail /blast-perf-test/batch/efs --follow --region $REGION"
-echo ""
-echo "  # Lustre"
-echo "  aws logs tail /blast-perf-test/batch/lustre --follow --region $REGION"
-echo ""
-echo "  # S3"
-echo "  aws logs tail /blast-perf-test/batch/s3 --follow --region $REGION"
-echo ""
-echo "Performance analysis (after jobs complete):"
-echo "  ./analyze_performance.py $REGION"
+echo
+echo "Status:  aws batch describe-jobs --jobs ${JOB_IDS[*]} --region $REGION --query 'jobs[].{name:jobName,status:status,reason:statusReason}' --output table"
+echo "Analyze: ./analyze_performance.py --region $REGION --project $PROJECT_NAME --run $TIMESTAMP"
+echo "$TIMESTAMP ${JOB_IDS[*]}" >> .runs.log

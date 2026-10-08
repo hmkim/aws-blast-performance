@@ -1,10 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'BLAST Performance Test - AWS Batch Environment for 3 Scenarios'
+Description: 'BLAST Performance Test - AWS Batch environment for 3 storage scenarios (EFS / FSx for Lustre / S3 -> local NVMe)'
 
 Parameters:
   ProjectName:
     Type: String
     Default: blast-perf-test
+
+  BlastDbName:
+    Type: String
+    Default: nt
+    Description: Must match the value used in the EFS and Lustre stacks
 
   QueryS3Bucket:
     Type: String
@@ -13,15 +18,59 @@ Parameters:
   QueryS3Key:
     Type: String
     Default: queries/query.fasta
-    Description: S3 key for query file
+    Description: S3 key of the query FASTA
 
   LustreFileSystemId:
     Type: String
-    Description: FSx for Lustre file system ID
+    Description: FSx for Lustre file system ID (output of the Lustre stack)
 
   LustreMountName:
     Type: String
-    Description: FSx for Lustre mount name
+    Description: FSx for Lustre mount name (output of the Lustre stack)
+
+  BlastImage:
+    Type: String
+    Default: public.ecr.aws/ncbi-elasticblast/elasticblast-elb:1.4.0
+    Description: >-
+      Container image. The plain ncbi/blast image does NOT contain the AWS CLI, so the
+      job scripts (aws s3 cp) fail in it. NCBI's ElasticBLAST image is ncbi/blast:2.17.0
+      plus awscli, vmtouch and GNU parallel. Pin a tag; never use :latest for a benchmark.
+
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Default: r6id.12xlarge,r5d.12xlarge
+    Description: >-
+      Identical instance pool for all three scenarios so that CPU and RAM are held constant
+      and only the storage layer differs. Must be d-type (local NVMe) with enough instance
+      store for the DB: nt is ~1.2 TB, r6id.12xlarge has 2 x 1,425 GB, r5d.12xlarge 2 x 900 GB.
+      With 384 GiB RAM the nt search is disk-bound (nt bytes-to-cache = 1,170 GB), which is
+      the regime in which the storage layer actually matters. For a RAM-resident run use
+      core_nt (272 GB to cache) on the same instances.
+
+  JobVcpus:
+    Type: Number
+    Default: 48
+    Description: vCPUs per job (also used for blastn -num_threads). r6id/r5d.12xlarge = 48.
+
+  JobMemoryMiB:
+    Type: Number
+    Default: 370000
+    Description: >-
+      Memory per job in MiB. Must be below what the ECS agent reports as available on the
+      instance (384 GiB installed -> roughly 386,000 MiB usable). ElasticBLAST uses RAM - 2 GB.
+
+  BlastPasses:
+    Type: Number
+    Default: 2
+    Description: >-
+      Number of consecutive blastn passes per job. Pass 1 is cold (data read from the storage
+      layer), pass 2+ is warm (served from the page cache when the DB fits in RAM). The
+      difference isolates the storage-layer cost.
+
+  JobTimeoutSeconds:
+    Type: Number
+    Default: 21600
+    Description: Hard stop per job attempt (cost guard). 6 h default.
 
 Resources:
   BatchServiceRole:
@@ -49,22 +98,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
-        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
-      Policies:
-        - PolicyName: S3Access
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:ListBucket
-                Resource:
-                  - !Sub arn:aws:s3:::${QueryS3Bucket}/*
-                  - !Sub arn:aws:s3:::${QueryS3Bucket}
-                  - arn:aws:s3:::ncbi-blast-databases/*
-                  - arn:aws:s3:::ncbi-blast-databases
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 
   BatchInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -95,20 +129,87 @@ Resources:
                 Resource:
                   - !Sub arn:aws:s3:::${QueryS3Bucket}/*
                   - !Sub arn:aws:s3:::${QueryS3Bucket}
-                  - arn:aws:s3:::ncbi-blast-databases/*
-                  - arn:aws:s3:::ncbi-blast-databases
-        - PolicyName: CloudWatchLogs
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
               - Effect: Allow
                 Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: '*'
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub
+                    - arn:aws:s3:::${Bucket}/*
+                    - Bucket: !ImportValue
+                        Fn::Sub: ${ProjectName}-lustre-s3-bucket
+                  - !Sub
+                    - arn:aws:s3:::${Bucket}
+                    - Bucket: !ImportValue
+                        Fn::Sub: ${ProjectName}-lustre-s3-bucket
 
-  # Scenario 1: EFS
+  # ------------------------------------------------------------------
+  # Launch templates (host-level preparation that the container cannot do)
+  # ------------------------------------------------------------------
+
+  # Scenario 2: mount FSx for Lustre on the host before the ECS agent registers.
+  LustreLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        UserData:
+          Fn::Base64: !Sub |
+            MIME-Version: 1.0
+            Content-Type: multipart/mixed; boundary="==MYBOUNDARY=="
+
+            --==MYBOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+
+            #!/bin/bash
+            set -euo pipefail
+            # ECS-optimized Amazon Linux 2023 (AWS Batch default AMI). AL2 would need
+            # `amazon-linux-extras install -y lustre` instead.
+            dnf install -y lustre-client
+            mkdir -p /mnt/lustre
+            mount -t lustre -o relatime,flock \
+              ${LustreFileSystemId}.fsx.${AWS::Region}.amazonaws.com@tcp:/${LustreMountName} /mnt/lustre
+            df -h /mnt/lustre
+
+            --==MYBOUNDARY==--
+
+  # Scenario 3: format the instance-store NVMe disk(s) into a RAID0 ext4 volume at /mnt/nvme.
+  # Without this, "/mnt/nvme" inside the container is just the container's overlay
+  # filesystem on the ~30 GiB root EBS volume and a 1.2 TB download fails with ENOSPC.
+  NvmeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        UserData:
+          Fn::Base64: |
+            MIME-Version: 1.0
+            Content-Type: multipart/mixed; boundary="==MYBOUNDARY=="
+
+            --==MYBOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+
+            #!/bin/bash
+            set -euo pipefail
+            dnf install -y mdadm
+            DEVS=$(lsblk -dpno NAME,MODEL | awk '/Amazon EC2 NVMe Instance Storage/ {print $1}')
+            N=$(echo $DEVS | wc -w)
+            if [ "$N" -eq 0 ]; then echo "no instance-store NVMe found" >&2; exit 1; fi
+            if [ "$N" -gt 1 ]; then
+              mdadm --create /dev/md0 --level=0 --raid-devices=$N $DEVS --force --run
+              DEV=/dev/md0
+            else
+              DEV=$DEVS
+            fi
+            mkfs.ext4 -F -E nodiscard -m 0 $DEV
+            mkdir -p /mnt/nvme
+            mount -o noatime $DEV /mnt/nvme
+            chmod 1777 /mnt/nvme
+            df -h /mnt/nvme
+
+            --==MYBOUNDARY==--
+
+  # ------------------------------------------------------------------
+  # Scenario 1: EFS (DB pre-staged by the EFS stack)
+  # ------------------------------------------------------------------
   ComputeEnvironmentEFS:
     Type: AWS::Batch::ComputeEnvironment
     Properties:
@@ -116,11 +217,13 @@ Resources:
       ServiceRole: !GetAtt BatchServiceRole.Arn
       ComputeResources:
         Type: EC2
+        AllocationStrategy: BEST_FIT_PROGRESSIVE
         MinvCpus: 0
         MaxvCpus: 384
         DesiredvCpus: 0
-        InstanceTypes:
-          - optimal
+        InstanceTypes: !Ref InstanceTypes
+        Ec2Configuration:
+          - ImageType: ECS_AL2023
         Subnets:
           - !ImportValue 
               Fn::Sub: ${ProjectName}-private-subnet-1
@@ -132,10 +235,13 @@ Resources:
         InstanceRole: !GetAtt BatchInstanceProfile.Arn
         Tags:
           Name: !Sub ${ProjectName}-efs-compute
+          project: !Ref ProjectName
+          scenario: efs
 
   JobQueueEFS:
     Type: AWS::Batch::JobQueue
     Properties:
+      JobQueueName: !Sub ${ProjectName}-efs
       Priority: 1
       ComputeEnvironmentOrder:
         - Order: 1
@@ -148,39 +254,58 @@ Resources:
       JobDefinitionName: !Sub ${ProjectName}-blastn-efs
       PlatformCapabilities:
         - EC2
+      PropagateTags: true
+      RetryStrategy:
+        Attempts: 1
+      Timeout:
+        AttemptDurationSeconds: !Ref JobTimeoutSeconds
       ContainerProperties:
-        Image: ncbi/blast:latest
-        Vcpus: 32
-        Memory: 768000
+        Image: !Ref BlastImage
+        ResourceRequirements:
+          - Type: VCPU
+            Value: !Ref JobVcpus
+          - Type: MEMORY
+            Value: !Ref JobMemoryMiB
         JobRoleArn: !GetAtt BatchJobRole.Arn
+        Environment:
+          - Name: SCENARIO
+            Value: efs
+          - Name: DB_PATH
+            Value: !Sub /mnt/efs/${BlastDbName}/${BlastDbName}
+          - Name: QUERY_S3_BUCKET
+            Value: !Ref QueryS3Bucket
+          - Name: QUERY_S3_KEY
+            Value: !Ref QueryS3Key
+          - Name: NUM_THREADS
+            Value: !Ref JobVcpus
+          - Name: PASSES
+            Value: !Ref BlastPasses
+          - Name: BLAST_USAGE_REPORT
+            Value: 'false'
         Command:
           - /bin/bash
           - -c
           - |
-            set -e
-            START_TIME=$(date +%s)
-            echo "Job started at $(date)"
-            
-            # 쿼리 다운로드
-            aws s3 cp s3://Ref::QueryS3Bucket/Ref::QueryS3Key /tmp/query.fasta
-            
-            # BLASTN 실행
-            blastn \
-              -db /mnt/efs/nt/nt \
-              -query /tmp/query.fasta \
-              -num_threads 32 \
-              -evalue 1.0E-3 \
-              -max_target_seqs 5 \
-              -outfmt '6 qseqid qstart qend qcovs qcovhsp qcovus sseqid stitle sstart send evalue bitscore nident pident mismatch gaps sstrand staxids sscinames' \
-              -out /tmp/results.out
-            
-            # 결과 업로드
-            aws s3 cp /tmp/results.out s3://Ref::QueryS3Bucket/results/efs/results-$(date +%Y%m%d-%H%M%S).out
-            
-            END_TIME=$(date +%s)
-            DURATION=$((END_TIME - START_TIME))
-            echo "Job completed at $(date)"
-            echo "Total duration: ${DURATION} seconds"
+            set -euo pipefail
+            T_START=$(date +%s)
+            echo "METRIC scenario=$SCENARIO job=$AWS_BATCH_JOB_ID"
+            echo "METRIC instance_type=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || echo unknown)"
+            echo "METRIC blast_version=$(blastn -version | head -1 | awk '{print $2}')"
+            aws s3 cp "s3://$QUERY_S3_BUCKET/$QUERY_S3_KEY" /tmp/query.fasta
+            echo "METRIC db_setup_seconds=0 (pre-staged)"
+            blastdbcmd -db "$DB_PATH" -info > /tmp/dbinfo.txt; head -4 /tmp/dbinfo.txt
+            for p in $(seq 1 "$PASSES"); do
+              P0=$(date +%s)
+              blastn -db "$DB_PATH" -query /tmp/query.fasta -num_threads "$NUM_THREADS" \
+                -evalue 1.0E-3 -max_target_seqs 5 \
+                -outfmt '6 qseqid qstart qend qcovs qcovhsp qcovus sseqid stitle sstart send evalue bitscore nident pident mismatch gaps sstrand staxids sscinames' \
+                -out /tmp/results.pass$p.out
+              P1=$(date +%s)
+              echo "METRIC pass=$p blast_seconds=$((P1 - P0)) rows=$(wc -l < /tmp/results.pass$p.out) sha256=$(sort /tmp/results.pass$p.out | sha256sum | cut -c1-16)"
+            done
+            STAMP=$(date +%Y%m%d-%H%M%S)
+            aws s3 cp /tmp/results.pass1.out "s3://$QUERY_S3_BUCKET/results/$SCENARIO/results-$STAMP.out"
+            echo "METRIC total_seconds=$(( $(date +%s) - T_START ))"
         MountPoints:
           - SourceVolume: efs
             ContainerPath: /mnt/efs
@@ -201,10 +326,12 @@ Resources:
   LogGroupEFS:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /blast-perf-test/batch/efs
-      RetentionInDays: 7
+      LogGroupName: !Sub /${ProjectName}/batch/efs
+      RetentionInDays: 14
 
-  # Scenario 2: Lustre
+  # ------------------------------------------------------------------
+  # Scenario 2: FSx for Lustre (DB lazy-loaded from the linked S3 bucket on first read)
+  # ------------------------------------------------------------------
   ComputeEnvironmentLustre:
     Type: AWS::Batch::ComputeEnvironment
     Properties:
@@ -212,47 +339,34 @@ Resources:
       ServiceRole: !GetAtt BatchServiceRole.Arn
       ComputeResources:
         Type: EC2
+        AllocationStrategy: BEST_FIT_PROGRESSIVE
         MinvCpus: 0
         MaxvCpus: 384
         DesiredvCpus: 0
-        InstanceTypes:
-          - optimal
+        InstanceTypes: !Ref InstanceTypes
+        Ec2Configuration:
+          - ImageType: ECS_AL2023
         Subnets:
+          # FSx for Lustre is single-AZ: keep the compute in the file system's subnet
+          # to avoid cross-AZ data charges and latency.
           - !ImportValue 
               Fn::Sub: ${ProjectName}-private-subnet-1
-          - !ImportValue 
-              Fn::Sub: ${ProjectName}-private-subnet-2
         SecurityGroupIds:
           - !ImportValue 
               Fn::Sub: ${ProjectName}-batch-sg-id
         InstanceRole: !GetAtt BatchInstanceProfile.Arn
         LaunchTemplate:
           LaunchTemplateId: !Ref LustreLaunchTemplate
+          Version: !GetAtt LustreLaunchTemplate.LatestVersionNumber
         Tags:
           Name: !Sub ${ProjectName}-lustre-compute
-
-  LustreLaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
-    Properties:
-      LaunchTemplateData:
-        UserData:
-          Fn::Base64: !Sub |
-            MIME-Version: 1.0
-            Content-Type: multipart/mixed; boundary="==MYBOUNDARY=="
-
-            --==MYBOUNDARY==
-            Content-Type: text/x-shellscript; charset="us-ascii"
-
-            #!/bin/bash
-            yum install -y lustre-client
-            mkdir -p /mnt/lustre
-            mount -t lustre ${LustreFileSystemId}.fsx.${AWS::Region}.amazonaws.com@tcp:/${LustreMountName} /mnt/lustre
-
-            --==MYBOUNDARY==--
+          project: !Ref ProjectName
+          scenario: lustre
 
   JobQueueLustre:
     Type: AWS::Batch::JobQueue
     Properties:
+      JobQueueName: !Sub ${ProjectName}-lustre
       Priority: 1
       ComputeEnvironmentOrder:
         - Order: 1
@@ -265,40 +379,65 @@ Resources:
       JobDefinitionName: !Sub ${ProjectName}-blastn-lustre
       PlatformCapabilities:
         - EC2
+      PropagateTags: true
+      RetryStrategy:
+        Attempts: 1
+      Timeout:
+        AttemptDurationSeconds: !Ref JobTimeoutSeconds
       ContainerProperties:
-        Image: ncbi/blast:latest
-        Vcpus: 32
-        Memory: 768000
+        Image: !Ref BlastImage
+        ResourceRequirements:
+          - Type: VCPU
+            Value: !Ref JobVcpus
+          - Type: MEMORY
+            Value: !Ref JobMemoryMiB
         JobRoleArn: !GetAtt BatchJobRole.Arn
-        Privileged: true
+        Environment:
+          - Name: SCENARIO
+            Value: lustre
+          - Name: DB_PATH
+            Value: !Sub /mnt/lustre/${BlastDbName}/${BlastDbName}
+          - Name: QUERY_S3_BUCKET
+            Value: !Ref QueryS3Bucket
+          - Name: QUERY_S3_KEY
+            Value: !Ref QueryS3Key
+          - Name: NUM_THREADS
+            Value: !Ref JobVcpus
+          - Name: PASSES
+            Value: !Ref BlastPasses
+          - Name: BLAST_USAGE_REPORT
+            Value: 'false'
         Command:
           - /bin/bash
           - -c
           - |
-            set -e
-            START_TIME=$(date +%s)
-            echo "Job started at $(date)"
-            
-            # 쿼리 다운로드
-            aws s3 cp s3://Ref::QueryS3Bucket/Ref::QueryS3Key /tmp/query.fasta
-            
-            # BLASTN 실행
-            blastn \
-              -db /mnt/lustre/nt/nt \
-              -query /tmp/query.fasta \
-              -num_threads 32 \
-              -evalue 1.0E-3 \
-              -max_target_seqs 5 \
-              -outfmt '6 qseqid qstart qend qcovs qcovhsp qcovus sseqid stitle sstart send evalue bitscore nident pident mismatch gaps sstrand staxids sscinames' \
-              -out /tmp/results.out
-            
-            # 결과 업로드
-            aws s3 cp /tmp/results.out s3://Ref::QueryS3Bucket/results/lustre/results-$(date +%Y%m%d-%H%M%S).out
-            
-            END_TIME=$(date +%s)
-            DURATION=$((END_TIME - START_TIME))
-            echo "Job completed at $(date)"
-            echo "Total duration: ${DURATION} seconds"
+            set -euo pipefail
+            T_START=$(date +%s)
+            echo "METRIC scenario=$SCENARIO job=$AWS_BATCH_JOB_ID"
+            echo "METRIC instance_type=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || echo unknown)"
+            echo "METRIC blast_version=$(blastn -version | head -1 | awk '{print $2}')"
+            aws s3 cp "s3://$QUERY_S3_BUCKET/$QUERY_S3_KEY" /tmp/query.fasta
+            # Lustre lazy-loads file contents from S3 on first access. Pre-reading the DB
+            # files with vmtouch (-t = touch into memory) makes the S3->Lustre hydration a
+            # separately measured step; pass 1 then measures Lustre->client throughput.
+            H0=$(date +%s)
+            find "$(dirname "$DB_PATH")" -maxdepth 1 -type f -name "$(basename "$DB_PATH").*" -print0 \
+              | parallel --will-cite -0 -j 16 vmtouch -tq {} || true
+            H1=$(date +%s)
+            echo "METRIC db_setup_seconds=$((H1 - H0)) (lustre hydration via vmtouch -t)"
+            blastdbcmd -db "$DB_PATH" -info > /tmp/dbinfo.txt; head -4 /tmp/dbinfo.txt
+            for p in $(seq 1 "$PASSES"); do
+              P0=$(date +%s)
+              blastn -db "$DB_PATH" -query /tmp/query.fasta -num_threads "$NUM_THREADS" \
+                -evalue 1.0E-3 -max_target_seqs 5 \
+                -outfmt '6 qseqid qstart qend qcovs qcovhsp qcovus sseqid stitle sstart send evalue bitscore nident pident mismatch gaps sstrand staxids sscinames' \
+                -out /tmp/results.pass$p.out
+              P1=$(date +%s)
+              echo "METRIC pass=$p blast_seconds=$((P1 - P0)) rows=$(wc -l < /tmp/results.pass$p.out) sha256=$(sort /tmp/results.pass$p.out | sha256sum | cut -c1-16)"
+            done
+            STAMP=$(date +%Y%m%d-%H%M%S)
+            aws s3 cp /tmp/results.pass1.out "s3://$QUERY_S3_BUCKET/results/$SCENARIO/results-$STAMP.out"
+            echo "METRIC total_seconds=$(( $(date +%s) - T_START ))"
         MountPoints:
           - SourceVolume: lustre
             ContainerPath: /mnt/lustre
@@ -317,10 +456,12 @@ Resources:
   LogGroupLustre:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /blast-perf-test/batch/lustre
-      RetentionInDays: 7
+      LogGroupName: !Sub /${ProjectName}/batch/lustre
+      RetentionInDays: 14
 
-  # Scenario 3: S3 Download (baseline)
+  # ------------------------------------------------------------------
+  # Scenario 3: S3 -> local NVMe (baseline; what ElasticBLAST does per instance)
+  # ------------------------------------------------------------------
   ComputeEnvironmentS3:
     Type: AWS::Batch::ComputeEnvironment
     Properties:
@@ -328,11 +469,13 @@ Resources:
       ServiceRole: !GetAtt BatchServiceRole.Arn
       ComputeResources:
         Type: EC2
+        AllocationStrategy: BEST_FIT_PROGRESSIVE
         MinvCpus: 0
         MaxvCpus: 384
         DesiredvCpus: 0
-        InstanceTypes:
-          - optimal
+        InstanceTypes: !Ref InstanceTypes
+        Ec2Configuration:
+          - ImageType: ECS_AL2023
         Subnets:
           - !ImportValue 
               Fn::Sub: ${ProjectName}-private-subnet-1
@@ -342,12 +485,18 @@ Resources:
           - !ImportValue 
               Fn::Sub: ${ProjectName}-batch-sg-id
         InstanceRole: !GetAtt BatchInstanceProfile.Arn
+        LaunchTemplate:
+          LaunchTemplateId: !Ref NvmeLaunchTemplate
+          Version: !GetAtt NvmeLaunchTemplate.LatestVersionNumber
         Tags:
           Name: !Sub ${ProjectName}-s3-compute
+          project: !Ref ProjectName
+          scenario: s3-nvme
 
   JobQueueS3:
     Type: AWS::Batch::JobQueue
     Properties:
+      JobQueueName: !Sub ${ProjectName}-s3
       Priority: 1
       ComputeEnvironmentOrder:
         - Order: 1
@@ -360,62 +509,90 @@ Resources:
       JobDefinitionName: !Sub ${ProjectName}-blastn-s3
       PlatformCapabilities:
         - EC2
+      PropagateTags: true
+      RetryStrategy:
+        Attempts: 1
+      Timeout:
+        AttemptDurationSeconds: !Ref JobTimeoutSeconds
       ContainerProperties:
-        Image: ncbi/blast:latest
-        Vcpus: 32
-        Memory: 768000
+        Image: !Ref BlastImage
+        ResourceRequirements:
+          - Type: VCPU
+            Value: !Ref JobVcpus
+          - Type: MEMORY
+            Value: !Ref JobMemoryMiB
         JobRoleArn: !GetAtt BatchJobRole.Arn
+        Environment:
+          - Name: SCENARIO
+            Value: s3
+          - Name: DB_NAME
+            Value: !Ref BlastDbName
+          # In-region copy made by the Lustre stack (same bytes the Lustre scenario reads),
+          # so the S3 scenario measures in-region S3 -> NVMe, not cross-region from NCBI.
+          - Name: DB_SOURCE_URI
+            Value: !Sub
+              - s3://${Bucket}/${BlastDbName}/
+              - Bucket: !ImportValue
+                  Fn::Sub: ${ProjectName}-lustre-s3-bucket
+          - Name: DB_PATH
+            Value: !Sub /mnt/nvme/${BlastDbName}/${BlastDbName}
+          - Name: QUERY_S3_BUCKET
+            Value: !Ref QueryS3Bucket
+          - Name: QUERY_S3_KEY
+            Value: !Ref QueryS3Key
+          - Name: NUM_THREADS
+            Value: !Ref JobVcpus
+          - Name: PASSES
+            Value: !Ref BlastPasses
+          - Name: BLAST_USAGE_REPORT
+            Value: 'false'
         Command:
           - /bin/bash
           - -c
           - |
-            set -e
-            START_TIME=$(date +%s)
-            echo "Job started at $(date)"
-            
-            # NT DB 다운로드
-            DB_START=$(date +%s)
-            mkdir -p /mnt/nvme/nt
-            cd /mnt/nvme/nt
-            
-            aws s3 sync s3://ncbi-blast-databases/ . \
-              --exclude "*" \
-              --include "nt.*" \
-              --include "nt-nucl-metadata.json" \
-              --include "taxdb.tar.gz"
-            
-            for file in *.tar.gz; do
-              tar -xzf "$file" && rm "$file"
+            set -euo pipefail
+            T_START=$(date +%s)
+            echo "METRIC scenario=$SCENARIO job=$AWS_BATCH_JOB_ID"
+            echo "METRIC instance_type=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || echo unknown)"
+            echo "METRIC blast_version=$(blastn -version | head -1 | awk '{print $2}')"
+            df -h /mnt/nvme
+            mkdir -p "/mnt/nvme/$DB_NAME"
+            aws configure set default.s3.max_concurrent_requests 64
+            D0=$(date +%s)
+            # Same instance may serve several jobs: reuse the DB if a previous job completed it.
+            if [ ! -f "/mnt/nvme/$DB_NAME/.done" ]; then
+              aws s3 sync "$DB_SOURCE_URI" "/mnt/nvme/$DB_NAME/" --only-show-errors \
+                --exclude "*" --include "$DB_NAME.*" --include "taxdb.*"
+              touch "/mnt/nvme/$DB_NAME/.done"
+            else
+              echo "DB already present on this instance (warm instance)"
+            fi
+            D1=$(date +%s)
+            BYTES=$(du -sb "/mnt/nvme/$DB_NAME" | cut -f1)
+            SECS=$((D1 - D0)); [ "$SECS" -eq 0 ] && SECS=1
+            echo "METRIC db_setup_seconds=$((D1 - D0)) db_bytes=$BYTES mbps=$(( BYTES / 1000000 / SECS ))"
+            aws s3 cp "s3://$QUERY_S3_BUCKET/$QUERY_S3_KEY" /tmp/query.fasta
+            blastdbcmd -db "$DB_PATH" -info > /tmp/dbinfo.txt; head -4 /tmp/dbinfo.txt
+            for p in $(seq 1 "$PASSES"); do
+              P0=$(date +%s)
+              blastn -db "$DB_PATH" -query /tmp/query.fasta -num_threads "$NUM_THREADS" \
+                -evalue 1.0E-3 -max_target_seqs 5 \
+                -outfmt '6 qseqid qstart qend qcovs qcovhsp qcovus sseqid stitle sstart send evalue bitscore nident pident mismatch gaps sstrand staxids sscinames' \
+                -out /tmp/results.pass$p.out
+              P1=$(date +%s)
+              echo "METRIC pass=$p blast_seconds=$((P1 - P0)) rows=$(wc -l < /tmp/results.pass$p.out) sha256=$(sort /tmp/results.pass$p.out | sha256sum | cut -c1-16)"
             done
-            
-            DB_END=$(date +%s)
-            DB_DURATION=$((DB_END - DB_START))
-            echo "DB download duration: ${DB_DURATION} seconds"
-            
-            # 쿼리 다운로드
-            aws s3 cp s3://Ref::QueryS3Bucket/Ref::QueryS3Key /tmp/query.fasta
-            
-            # BLASTN 실행
-            BLAST_START=$(date +%s)
-            blastn \
-              -db /mnt/nvme/nt/nt \
-              -query /tmp/query.fasta \
-              -num_threads 32 \
-              -evalue 1.0E-3 \
-              -max_target_seqs 5 \
-              -outfmt '6 qseqid qstart qend qcovs qcovhsp qcovus sseqid stitle sstart send evalue bitscore nident pident mismatch gaps sstrand staxids sscinames' \
-              -out /tmp/results.out
-            BLAST_END=$(date +%s)
-            BLAST_DURATION=$((BLAST_END - BLAST_START))
-            echo "BLAST execution duration: ${BLAST_DURATION} seconds"
-            
-            # 결과 업로드
-            aws s3 cp /tmp/results.out s3://Ref::QueryS3Bucket/results/s3/results-$(date +%Y%m%d-%H%M%S).out
-            
-            END_TIME=$(date +%s)
-            DURATION=$((END_TIME - START_TIME))
-            echo "Job completed at $(date)"
-            echo "Total duration: ${DURATION} seconds"
+            STAMP=$(date +%Y%m%d-%H%M%S)
+            aws s3 cp /tmp/results.pass1.out "s3://$QUERY_S3_BUCKET/results/$SCENARIO/results-$STAMP.out"
+            echo "METRIC total_seconds=$(( $(date +%s) - T_START ))"
+        MountPoints:
+          - SourceVolume: nvme
+            ContainerPath: /mnt/nvme
+            ReadOnly: false
+        Volumes:
+          - Name: nvme
+            Host:
+              SourcePath: /mnt/nvme
         LogConfiguration:
           LogDriver: awslogs
           Options:
@@ -426,8 +603,8 @@ Resources:
   LogGroupS3:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /blast-perf-test/batch/s3
-      RetentionInDays: 7
+      LogGroupName: !Sub /${ProjectName}/batch/s3
+      RetentionInDays: 14
 
 Outputs:
   JobQueueEFSArn:

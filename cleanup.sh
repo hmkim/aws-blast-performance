@@ -2,7 +2,7 @@
 set -e
 
 PROJECT_NAME="${PROJECT_NAME:-blast-perf-test}"
-REGION="${REGION:-us-east-1}"
+REGION="${REGION:-${AWS_REGION:-us-east-1}}"
 
 echo "=========================================="
 echo "BLAST Performance Test Infrastructure Cleanup"
@@ -18,7 +18,7 @@ fi
 echo -e "\n[1/5] Cleaning up S3 buckets..."
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 QUERY_BUCKET="${PROJECT_NAME}-queries-${ACCOUNT_ID}"
-LUSTRE_BUCKET="blast-nt-lustre-${REGION}-${ACCOUNT_ID}"
+LUSTRE_BUCKET="${LUSTRE_BUCKET_PREFIX:-blast-nt-lustre}-${ACCOUNT_ID}"
 
 echo "Deleting query bucket: $QUERY_BUCKET"
 aws s3 rb s3://$QUERY_BUCKET --force --region $REGION 2>/dev/null || echo "Bucket does not exist"

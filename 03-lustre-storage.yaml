@@ -1,23 +1,44 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'BLAST Performance Test - FSx for Lustre Storage with S3 Integration'
+Description: 'BLAST Performance Test - FSx for Lustre linked to an S3 copy of the NCBI BLAST DB'
 
 Parameters:
   ProjectName:
     Type: String
     Default: blast-perf-test
 
+  BlastDbName:
+    Type: String
+    Default: nt
+    Description: NCBI BLAST database to copy (must match the EFS stack if you compare the two)
+
   S3BucketName:
     Type: String
-    Description: S3 bucket name for Lustre data repository (must be unique)
+    Description: S3 bucket name prefix for the Lustre data repository (account id is appended)
     Default: blast-nt-db-lustre
+
+  LustreStorageCapacity:
+    Type: Number
+    Default: 2400
+    AllowedValues: [1200, 2400, 3600, 4800, 7200]
+    Description: >-
+      SCRATCH_2 capacity in GiB (1200, then multiples of 2400). nt is ~1,120 GiB (2026-09),
+      which would fill a 1200 GiB file system to ~93% - near-full OSTs degrade or hang Lustre,
+      so 2400 is the default for nt. Throughput scales with capacity:
+      SCRATCH_2 = 200 MB/s per TiB baseline (burst 1,300 MB/s per TiB), i.e. ~470 MB/s at 2400 GiB.
+      For a smoke test with a small DB use 1200.
+
+  CopyInstanceType:
+    Type: String
+    Default: m6i.large
+    Description: >-
+      The copy is an S3->S3 server-side copy (no data flows through the instance),
+      so a small instance is enough.
 
 Resources:
   S3Bucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub ${S3BucketName}-${AWS::AccountId}
-      VersioningConfiguration:
-        Status: Enabled
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -28,7 +49,7 @@ Resources:
     Type: AWS::FSx::FileSystem
     Properties:
       FileSystemType: LUSTRE
-      StorageCapacity: 1200
+      StorageCapacity: !Ref LustreStorageCapacity
       SubnetIds:
         - !ImportValue 
             Fn::Sub: ${ProjectName}-private-subnet-1
@@ -37,13 +58,23 @@ Resources:
             Fn::Sub: ${ProjectName}-lustre-sg-id
       LustreConfiguration:
         DeploymentType: SCRATCH_2
-        ImportPath: !Sub s3://${S3Bucket}/nt/
-        ExportPath: !Sub s3://${S3Bucket}/nt-export/
+        ImportPath: !Sub s3://${S3Bucket}/
+        ExportPath: !Sub s3://${S3Bucket}/export/
         ImportedFileChunkSize: 1024
+        # The bucket is EMPTY when this file system is created (the copy below runs afterwards).
+        # Without an auto-import policy FSx only lists the objects present at creation time,
+        # so /mnt/lustre/<db> would stay empty. NEW_CHANGED makes later copies visible.
+        AutoImportPolicy: NEW_CHANGED
         DataCompressionType: NONE
       Tags:
         - Key: Name
-          Value: !Sub ${ProjectName}-lustre-nt-db
+          Value: !Sub ${ProjectName}-lustre-${BlastDbName}-db
+
+  CopyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${ProjectName}/lustre/db-s3-copy
+      RetentionInDays: 14
 
   DBCopyInstanceRole:
     Type: AWS::IAM::Role
@@ -59,18 +90,37 @@ Resources:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
         - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
       Policies:
-        - PolicyName: S3Access
+        - PolicyName: S3Copy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - s3:*
+                  - s3:GetObject
+                  - s3:ListBucket
                 Resource:
-                  - !Sub ${S3Bucket.Arn}/*
-                  - !GetAtt S3Bucket.Arn
                   - arn:aws:s3:::ncbi-blast-databases/*
                   - arn:aws:s3:::ncbi-blast-databases
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                Resource: !GetAtt S3Bucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Sub ${S3Bucket.Arn}/*
+        - PolicyName: SsmStatusParameter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*
 
   DBCopyInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -80,9 +130,11 @@ Resources:
 
   DBCopyInstance:
     Type: AWS::EC2::Instance
+    DependsOn:
+      - CopyLogGroup
     Properties:
-      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
-      InstanceType: r5d.24xlarge
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref CopyInstanceType
       IamInstanceProfile: !Ref DBCopyInstanceProfile
       SubnetId: !ImportValue 
         Fn::Sub: ${ProjectName}-private-subnet-1
@@ -92,16 +144,16 @@ Resources:
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
-            VolumeSize: 100
+            VolumeSize: 30
             VolumeType: gp3
             Encrypted: true
+      # NOTE: Fn::Sub template - shell variables are written as $VAR (no braces).
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          set -e
-          
-          # CloudWatch Logs 설정
-          yum install -y amazon-cloudwatch-agent
+          set -euo pipefail
+
+          dnf install -y amazon-cloudwatch-agent
           cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<'EOF'
           {
             "logs": {
@@ -109,8 +161,8 @@ Resources:
                 "files": {
                   "collect_list": [
                     {
-                      "file_path": "/var/log/nt-s3-copy.log",
-                      "log_group_name": "/blast-perf-test/lustre/nt-s3-copy",
+                      "file_path": "/var/log/db-s3-copy.log",
+                      "log_group_name": "/${ProjectName}/lustre/db-s3-copy",
                       "log_stream_name": "{instance_id}"
                     }
                   ]
@@ -122,28 +174,39 @@ Resources:
           /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
             -a fetch-config -m ec2 -s \
             -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
-          
-          exec > >(tee -a /var/log/nt-s3-copy.log) 2>&1
-          echo "$(date): Starting NT database copy to S3"
-          
-          # NCBI S3에서 자신의 S3로 복사
-          aws s3 sync s3://ncbi-blast-databases/ s3://${S3Bucket}/nt/ \
+
+          exec > >(tee -a /var/log/db-s3-copy.log) 2>&1
+
+          DB=${BlastDbName}
+          LATEST=$(aws s3 cp s3://ncbi-blast-databases/latest-dir - --region us-east-1)
+          SRC=s3://ncbi-blast-databases/$LATEST/
+          DEST=s3://${S3Bucket}/$DB/
+          echo "$(date -u +%FT%TZ) server-side copy $DB from $SRC to $DEST"
+
+          # NCBI stores unpacked volume files under a dated prefix; copy only this DB.
+          # The source bucket is in us-east-1; cross-region copies incur data transfer charges.
+          aws configure set default.s3.max_concurrent_requests 32
+          T0=$(date +%s)
+          aws s3 sync $SRC $DEST \
+            --source-region us-east-1 --region ${AWS::Region} --only-show-errors \
             --exclude "*" \
-            --include "nt.*" \
-            --include "nt-nucl-metadata.json" \
-            --include "taxdb.tar.gz" \
-            --region ${AWS::Region}
-          
-          echo "$(date): NT database copy to S3 completed"
-          aws s3 ls s3://${S3Bucket}/nt/ --recursive --human-readable --summarize
-          
-          # 완료 신호
+            --include "$DB.*" \
+            --include "$DB-nucl-metadata.json" \
+            --include "taxdb.*"
+          T1=$(date +%s)
+          echo "$(date -u +%FT%TZ) copy finished in $((T1 - T0)) seconds"
+          echo "$LATEST" | aws s3 cp - $DEST/SOURCE_PREFIX --region ${AWS::Region}
+          aws s3 ls $DEST --recursive --summarize --region ${AWS::Region} | tail -2
+
           aws ssm put-parameter \
-            --name "/blast-perf-test/lustre/s3-copy-status" \
-            --value "completed" \
-            --type String \
-            --overwrite \
-            --region ${AWS::Region} || true
+            --name "/${ProjectName}/lustre/db-s3-copy-status" \
+            --value "completed:$DB:$LATEST:$((T1 - T0))s" \
+            --type String --overwrite --region ${AWS::Region} || true
+
+          # Cost guard: this instance has no further purpose. Give the CloudWatch agent
+          # time to flush, then stop (not terminate - the stack still owns it).
+          sleep 60
+          shutdown -h now
 
       Tags:
         - Key: Name
@@ -167,4 +230,8 @@ Outputs:
 
   DBCopyInstanceId:
     Value: !Ref DBCopyInstance
-    Description: Instance ID for NT database copy to S3
+    Description: Copy instance (terminate it once the SSM parameter <ProjectName>/lustre/db-s3-copy-status reads completed)
+
+  StagedDbPath:
+    Value: !Sub /mnt/lustre/${BlastDbName}/${BlastDbName}
+    Description: -db argument for blastn when the file system is mounted at /mnt/lustre

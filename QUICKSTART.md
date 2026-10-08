@@ -1,149 +1,94 @@
-# Quick Start Guide
+# Quick Start
 
-Get started with BLAST performance testing in 4 steps.
-
-## Prerequisites
-
-- AWS CLI configured
-- AWS account with appropriate permissions
-- BLAST query file (FASTA format)
-
-## Step-by-Step Deployment
-
-### 1. Network Infrastructure (5 minutes)
+Copy-paste deployment. Times are for `nt` (1.2 TB); a smoke test with
+`BLAST_DB=ref_viruses_rep_genomes` (150 MB) finishes every step in minutes.
 
 ```bash
 export AWS_REGION=us-east-1
 export PROJECT_NAME=blast-perf-test
-
-aws cloudformation create-stack \
-  --stack-name ${PROJECT_NAME}-network \
-  --template-body file://01-network-infrastructure.yaml \
-  --parameters ParameterKey=ProjectName,ParameterValue=$PROJECT_NAME \
-  --region $AWS_REGION
-
-aws cloudformation wait stack-create-complete \
-  --stack-name ${PROJECT_NAME}-network \
-  --region $AWS_REGION
-```
-
-### 2. EFS Storage (2-3 hours)
-
-```bash
-aws cloudformation create-stack \
-  --stack-name ${PROJECT_NAME}-efs \
-  --template-body file://02-efs-storage.yaml \
-  --parameters ParameterKey=ProjectName,ParameterValue=$PROJECT_NAME \
-  --capabilities CAPABILITY_IAM \
-  --region $AWS_REGION
-
-# Monitor progress
-aws logs tail /${PROJECT_NAME}/efs/nt-download --follow --region $AWS_REGION
-```
-
-### 3. Lustre Storage (2-3 hours)
-
-```bash
-aws cloudformation create-stack \
-  --stack-name ${PROJECT_NAME}-lustre \
-  --template-body file://03-lustre-storage.yaml \
-  --parameters \
-    ParameterKey=ProjectName,ParameterValue=$PROJECT_NAME \
-    ParameterKey=S3BucketName,ParameterValue=blast-nt-lustre \
-  --capabilities CAPABILITY_IAM \
-  --region $AWS_REGION
-
-# Monitor progress
-aws logs tail /${PROJECT_NAME}/lustre/nt-s3-copy --follow --region $AWS_REGION
-```
-
-### 4. AWS Batch Environment (5 minutes)
-
-**Important**: Before deploying, ensure `04-batch-environment.yaml` has:
-- Lustre mount command fixed
-- Parameters for LustreFileSystemId and LustreMountName
-- Instance type set to `optimal`
-
-```bash
-# Upload query file
+export BLAST_DB=nt                 # or ref_viruses_rep_genomes / 16S_ribosomal_RNA for a smoke test
+export LUSTRE_GIB=2400             # 1200 is enough for small DBs; nt needs 2400
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-QUERY_BUCKET="${PROJECT_NAME}-queries-${ACCOUNT_ID}"
+```
 
+## 1. Network (5 min)
+
+```bash
+aws cloudformation deploy --stack-name ${PROJECT_NAME}-network \
+  --template-file 01-network-infrastructure.yaml \
+  --parameter-overrides ProjectName=$PROJECT_NAME --region $AWS_REGION
+```
+
+## 2. EFS + DB staging (nt: 2-3 h)
+
+```bash
+aws cloudformation deploy --stack-name ${PROJECT_NAME}-efs \
+  --template-file 02-efs-storage.yaml --capabilities CAPABILITY_IAM \
+  --parameter-overrides ProjectName=$PROJECT_NAME BlastDbName=$BLAST_DB --region $AWS_REGION
+
+# progress
+aws logs tail /${PROJECT_NAME}/efs/db-staging --follow --region $AWS_REGION
+# done when this prints completed:<db>:<ncbi-prefix>:<seconds>
+aws ssm get-parameter --name /${PROJECT_NAME}/efs/db-staging-status --region $AWS_REGION --query Parameter.Value --output text
+```
+
+The staging host stops itself when finished.
+
+## 3. FSx for Lustre + S3 copy (nt: 1-2 h)
+
+```bash
+aws cloudformation deploy --stack-name ${PROJECT_NAME}-lustre \
+  --template-file 03-lustre-storage.yaml --capabilities CAPABILITY_IAM \
+  --parameter-overrides ProjectName=$PROJECT_NAME BlastDbName=$BLAST_DB \
+    S3BucketName=blast-nt-lustre LustreStorageCapacity=$LUSTRE_GIB --region $AWS_REGION
+
+aws logs tail /${PROJECT_NAME}/lustre/db-s3-copy --follow --region $AWS_REGION
+aws ssm get-parameter --name /${PROJECT_NAME}/lustre/db-s3-copy-status --region $AWS_REGION --query Parameter.Value --output text
+```
+
+Steps 2 and 3 are independent; run them in parallel.
+
+## 4. Query bucket + AWS Batch (5 min)
+
+```bash
+QUERY_BUCKET=${PROJECT_NAME}-queries-${ACCOUNT_ID}
 aws s3 mb s3://$QUERY_BUCKET --region $AWS_REGION
 aws s3 cp data/query.fasta s3://$QUERY_BUCKET/queries/query.fasta
 
-# Get Lustre parameters
-LUSTRE_FS_ID=$(aws cloudformation describe-stacks \
-  --stack-name ${PROJECT_NAME}-lustre \
-  --region $AWS_REGION \
-  --query 'Stacks[0].Outputs[?OutputKey==`LustreFileSystemId`].OutputValue' \
-  --output text)
+LUSTRE_FS_ID=$(aws cloudformation describe-stacks --stack-name ${PROJECT_NAME}-lustre --region $AWS_REGION \
+  --query 'Stacks[0].Outputs[?OutputKey==`LustreFileSystemId`].OutputValue' --output text)
+LUSTRE_MOUNT=$(aws cloudformation describe-stacks --stack-name ${PROJECT_NAME}-lustre --region $AWS_REGION \
+  --query 'Stacks[0].Outputs[?OutputKey==`LustreMountName`].OutputValue' --output text)
 
-LUSTRE_MOUNT=$(aws cloudformation describe-stacks \
-  --stack-name ${PROJECT_NAME}-lustre \
-  --region $AWS_REGION \
-  --query 'Stacks[0].Outputs[?OutputKey==`LustreMountName`].OutputValue' \
-  --output text)
-
-# Deploy Batch
-aws cloudformation create-stack \
-  --stack-name ${PROJECT_NAME}-batch \
-  --template-body file://04-batch-environment.yaml \
-  --parameters \
-    ParameterKey=ProjectName,ParameterValue=$PROJECT_NAME \
-    ParameterKey=QueryS3Bucket,ParameterValue=$QUERY_BUCKET \
-    ParameterKey=LustreFileSystemId,ParameterValue=$LUSTRE_FS_ID \
-    ParameterKey=LustreMountName,ParameterValue=$LUSTRE_MOUNT \
-  --capabilities CAPABILITY_IAM \
-  --region $AWS_REGION
-
-aws cloudformation wait stack-create-complete \
-  --stack-name ${PROJECT_NAME}-batch \
+aws cloudformation deploy --stack-name ${PROJECT_NAME}-batch \
+  --template-file 04-batch-environment.yaml --capabilities CAPABILITY_IAM \
+  --parameter-overrides ProjectName=$PROJECT_NAME BlastDbName=$BLAST_DB \
+    QueryS3Bucket=$QUERY_BUCKET LustreFileSystemId=$LUSTRE_FS_ID LustreMountName=$LUSTRE_MOUNT \
   --region $AWS_REGION
 ```
 
-## Run Tests
+Optional overrides: `InstanceTypes=r6id.12xlarge,r5d.12xlarge` `JobVcpus=48` `JobMemoryMiB=370000`
+`BlastPasses=2` `BlastImage=public.ecr.aws/ncbi-elasticblast/elasticblast-elb:1.4.0`.
+
+## 5. Run
 
 ```bash
-./run_tests.sh
+./run_tests.sh              # all three; refuses to start until both staging signals read "completed"
+./run_tests.sh lustre s3    # subset
 ```
 
-## Monitor Jobs
+## 6. Monitor and analyze
 
 ```bash
-# Check job status
-aws batch describe-jobs --jobs <JOB_ID> --region $AWS_REGION
-
-# View logs
-aws logs tail /${PROJECT_NAME}/batch/efs --follow --region $AWS_REGION
-aws logs tail /${PROJECT_NAME}/batch/lustre --follow --region $AWS_REGION
-aws logs tail /${PROJECT_NAME}/batch/s3 --follow --region $AWS_REGION
+aws batch describe-jobs --jobs <JOB_ID ...> --region $AWS_REGION --query 'jobs[].{name:jobName,status:status,reason:statusReason}' --output table
+aws logs tail /${PROJECT_NAME}/batch/efs    --follow --region $AWS_REGION   # also .../lustre and .../s3
+./analyze_performance.py --region $AWS_REGION --project $PROJECT_NAME
 ```
 
-## Cleanup
+## 7. Cleanup
 
 ```bash
-./cleanup.sh
+./cleanup.sh        # or delete the four stacks in reverse order and the two buckets
 ```
 
-Or manually:
-
-```bash
-aws cloudformation delete-stack --stack-name ${PROJECT_NAME}-batch --region $AWS_REGION
-aws cloudformation delete-stack --stack-name ${PROJECT_NAME}-lustre --region $AWS_REGION
-aws cloudformation delete-stack --stack-name ${PROJECT_NAME}-efs --region $AWS_REGION
-aws cloudformation delete-stack --stack-name ${PROJECT_NAME}-network --region $AWS_REGION
-
-aws s3 rb s3://$QUERY_BUCKET --force --region $AWS_REGION
-aws s3 rb s3://blast-nt-lustre-${AWS_REGION}-${ACCOUNT_ID} --force --region $AWS_REGION
-```
-
-## Troubleshooting
-
-If jobs are stuck in RUNNABLE state, see [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md#troubleshooting) for solutions.
-
-## Next Steps
-
-- Review [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for detailed instructions
-- Analyze performance results
-- Optimize costs with SPOT instances
+FSx and EFS are billed hourly for provisioned/stored capacity: do not leave them up between runs.

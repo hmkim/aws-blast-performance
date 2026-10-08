@@ -1,373 +1,176 @@
-# BLAST Storage Performance Comparison Infrastructure Deployment Guide
+# BLAST Storage Performance Benchmark - Deployment Guide
 
-## Overview
+Companion to [README.md](README.md) (architecture, why three methods, verified facts) and
+[QUICKSTART.md](QUICKSTART.md) (copy-paste commands). This guide explains what each stack does,
+which parameters matter, how to read the results and how to recover from the failure modes that
+actually occur.
 
-Deployment and troubleshooting guide for AWS infrastructure comparing BLAST performance across three storage scenarios.
+## What gets deployed
 
-## Deployed Resources
+| Stack | Resources | Parameters that matter |
+|---|---|---|
+| `<project>-network` | VPC 10.0.0.0/16, 2 public + 2 private subnets (AZ a/b), IGW, NAT GW, **S3 gateway endpoint**, security groups (Batch; EFS 2049 from Batch; Lustre 988 from Batch and self) | `ProjectName` |
+| `<project>-efs` | EFS (encrypted, generalPurpose, **Elastic** throughput) + 2 mount targets; staging EC2 host that syncs `<db>.*`, `<db>-nucl-metadata.json`, `taxdb.*` from the current NCBI prefix into `/mnt/efs/<db>/`, writes the SSM parameter `/<project>/efs/db-staging-status`, then stops itself | `BlastDbName` (nt), `StagingInstanceType` (m6i.4xlarge) |
+| `<project>-lustre` | S3 bucket `<S3BucketName>-<account>`; FSx for Lustre SCRATCH_2 linked to that bucket (`AutoImportPolicy: NEW_CHANGED`); copy EC2 host that does a server-side `aws s3 sync` of the DB from NCBI into `s3://bucket/<db>/`, writes `/<project>/lustre/db-s3-copy-status`, stops itself | `BlastDbName`, `LustreStorageCapacity` (2400 for nt), `S3BucketName` |
+| `<project>-batch` | 3 managed compute environments (same instance pool, min 0 vCPU), 3 job queues, 3 job definitions, launch templates (Lustre mount; NVMe RAID0), job role, log groups `/<project>/batch/{efs,lustre,s3}` | `BlastDbName`, `QueryS3Bucket`, `LustreFileSystemId`, `LustreMountName`, `InstanceTypes`, `JobVcpus`, `JobMemoryMiB`, `BlastPasses`, `BlastImage` |
 
-### Network (VPC)
-- VPC: 10.0.0.0/16
-- Public Subnets: 2 (availability zones a, b)
-- Private Subnets: 2 (availability zones a, b)
-- NAT Gateway: 1
-- Internet Gateway: 1
+The DB name must be identical in the three storage/compute stacks: the Batch job definitions derive
+`-db /mnt/<layer>/<db>/<db>` from it.
 
-### Storage
-- **EFS**: 810 GB NT database
-- **FSx for Lustre**: 1200 GB NT database
-- **S3**: Query files and Lustre backup
+## Choosing the database and the instance pool
 
-### AWS Batch
-- Job Queues: 3 (EFS, Lustre, S3)
-- Compute Environments: 3 (384 vCPU each)
-- Job Definitions: 3 (32 vCPU, 768 GB memory)
+| DB (2026-09 snapshot) | Size | Bytes to cache | Fits in RAM of | Use |
+|---|---|---|---|---|
+| `nt` | 1,199 GB, 390 volumes | 1,170 GB | nothing in the R family (max 768 GiB) | storage-bound benchmark: the storage layer is the bottleneck in every pass |
+| `core_nt` | 301 GB, 91 volumes | 272 GB | r6id/r5d.12xlarge (384 GiB) | shows the "once cached, storage does not matter" regime: pass 2 is served from RAM |
+| `ref_prok_rep_genomes` | 26.7 GB | - | any | representative of targeted-DB screening workloads |
+| `ref_viruses_rep_genomes`, `16S_ribosomal_RNA` | 150 MB, 20 MB | - | any | smoke test of the pipeline |
 
-## Deployment Steps
+The default pool `r6id.12xlarge,r5d.12xlarge` (48 vCPU, 384 GiB, 2 NVMe disks of 1,425 GB / 900 GB)
+is the smallest d-type that holds nt on instance store. Keep the pool identical for the three
+scenarios; changing CPU or RAM between scenarios invalidates the comparison. `JobMemoryMiB` must stay
+below what the ECS agent registers for the instance (384 GiB installed -> about 386,000 MiB usable).
 
-### Step 1: Network Infrastructure
+## Step by step
 
-```bash
-aws cloudformation create-stack \
-  --stack-name blast-perf-test-network \
-  --template-body file://01-network-infrastructure.yaml \
-  --parameters ParameterKey=ProjectName,ParameterValue=blast-perf-test \
-  --region <YOUR_REGION>
-
-aws cloudformation wait stack-create-complete \
-  --stack-name blast-perf-test-network \
-  --region <YOUR_REGION>
-```
-
-### Step 2: EFS Storage and NT DB Upload
+### 1. Network
 
 ```bash
-aws cloudformation create-stack \
-  --stack-name blast-perf-test-efs \
-  --template-body file://02-efs-storage.yaml \
-  --parameters ParameterKey=ProjectName,ParameterValue=blast-perf-test \
-  --capabilities CAPABILITY_IAM \
-  --region <YOUR_REGION>
-
-aws cloudformation wait stack-create-complete \
-  --stack-name blast-perf-test-efs \
-  --region <YOUR_REGION>
-
-# Monitor NT DB download progress (~2-3 hours)
-aws logs tail /blast-perf-test/efs/nt-download --follow --region <YOUR_REGION>
+aws cloudformation deploy --stack-name ${PROJECT_NAME}-network \
+  --template-file 01-network-infrastructure.yaml \
+  --parameter-overrides ProjectName=$PROJECT_NAME --region $AWS_REGION
 ```
 
-### Step 3: Lustre Storage and S3 Copy
+### 2. EFS and staging
 
 ```bash
-BUCKET_NAME="blast-nt-lustre"
-
-aws cloudformation create-stack \
-  --stack-name blast-perf-test-lustre \
-  --template-body file://03-lustre-storage.yaml \
-  --parameters \
-    ParameterKey=ProjectName,ParameterValue=blast-perf-test \
-    ParameterKey=S3BucketName,ParameterValue=$BUCKET_NAME \
-  --capabilities CAPABILITY_IAM \
-  --region <YOUR_REGION>
-
-aws cloudformation wait stack-create-complete \
-  --stack-name blast-perf-test-lustre \
-  --region <YOUR_REGION>
-
-# Monitor S3 copy progress (~2-3 hours)
-aws logs tail /blast-perf-test/lustre/nt-s3-copy --follow --region <YOUR_REGION>
+aws cloudformation deploy --stack-name ${PROJECT_NAME}-efs \
+  --template-file 02-efs-storage.yaml --capabilities CAPABILITY_IAM \
+  --parameter-overrides ProjectName=$PROJECT_NAME BlastDbName=$BLAST_DB --region $AWS_REGION
 ```
 
-### Step 4: AWS Batch Environment
+The stack reaches `CREATE_COMPLETE` as soon as the host is running; the copy continues in the
+background. Follow it with `aws logs tail /${PROJECT_NAME}/efs/db-staging --follow` and wait for the
+SSM parameter `/${PROJECT_NAME}/efs/db-staging-status` to read `completed:<db>:<prefix>:<seconds>`.
+Expect 2-3 h for nt: a single NFS client writes at most 1,500 MiB/s, and EFS Elastic throughput
+charges $0.06 per GB written (about $72 for nt). The host stops itself when finished.
 
-#### 4-1. Upload Query Files
+### 3. FSx for Lustre and S3 copy
 
 ```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-QUERY_BUCKET="blast-perf-test-queries-${ACCOUNT_ID}"
-
-aws s3 mb s3://$QUERY_BUCKET --region <YOUR_REGION>
-aws s3 cp ../data/query.fasta s3://$QUERY_BUCKET/queries/query.fasta
+aws cloudformation deploy --stack-name ${PROJECT_NAME}-lustre \
+  --template-file 03-lustre-storage.yaml --capabilities CAPABILITY_IAM \
+  --parameter-overrides ProjectName=$PROJECT_NAME BlastDbName=$BLAST_DB \
+    S3BucketName=blast-nt-lustre LustreStorageCapacity=$LUSTRE_GIB --region $AWS_REGION
 ```
 
-#### 4-2. Batch Stack Deployment
+The copy is S3 -> S3 (server-side); in us-east-1 there is no transfer charge, elsewhere $0.02/GB
+leaves us-east-1. Follow `/${PROJECT_NAME}/lustre/db-s3-copy` and the parameter
+`/${PROJECT_NAME}/lustre/db-s3-copy-status`. Because the bucket is empty when the file system is
+created, the template sets `AutoImportPolicy: NEW_CHANGED`; the copied objects appear under
+`/mnt/lustre/<db>/` as metadata only, and their contents are pulled from S3 on first read
+(that first read is what the Lustre job measures as `db_setup_seconds`).
 
-**Important**: Modifications required in 04-batch-environment.yaml
-
-1. **Fix Lustre mount command**:
-```yaml
-# Incorrect:
-mount -t lustre ${LustreFileSystem.DNSName}@tcp:/fsx /mnt/lustre
-
-# Correct:
-mount -t lustre ${LustreFileSystemId}.fsx.${AWS::Region}.amazonaws.com@tcp:/${LustreMountName} /mnt/lustre
-```
-
-2. **Add to Parameters section**:
-```yaml
-Parameters:
-  LustreFileSystemId:
-    Type: String
-    Description: FSx for Lustre file system ID
-
-  LustreMountName:
-    Type: String
-    Description: FSx for Lustre mount name
-```
-
-3. **Set instance type to optimal** (resolves capacity issues):
-```yaml
-ComputeResources:
-  InstanceTypes:
-    - optimal  # Use optimal instead of specific instance types
-```
-
-#### 4-3. Deploy
+To pre-hydrate outside the job instead (not timed), run on any instance with the file system mounted:
 
 ```bash
-LUSTRE_FS_ID=$(aws cloudformation describe-stacks \
-  --stack-name blast-perf-test-lustre \
-  --region <YOUR_REGION> \
-  --query 'Stacks[0].Outputs[?OutputKey==`LustreFileSystemId`].OutputValue' \
-  --output text)
-
-LUSTRE_MOUNT=$(aws cloudformation describe-stacks \
-  --stack-name blast-perf-test-lustre \
-  --region <YOUR_REGION> \
-  --query 'Stacks[0].Outputs[?OutputKey==`LustreMountName`].OutputValue' \
-  --output text)
-
-aws cloudformation create-stack \
-  --stack-name blast-perf-test-batch \
-  --template-body file://04-batch-environment.yaml \
-  --parameters \
-    ParameterKey=ProjectName,ParameterValue=blast-perf-test \
-    ParameterKey=QueryS3Bucket,ParameterValue=$QUERY_BUCKET \
-    ParameterKey=LustreFileSystemId,ParameterValue=$LUSTRE_FS_ID \
-    ParameterKey=LustreMountName,ParameterValue=$LUSTRE_MOUNT \
-  --capabilities CAPABILITY_IAM \
-  --region <YOUR_REGION>
-
-aws cloudformation wait stack-create-complete \
-  --stack-name blast-perf-test-batch \
-  --region <YOUR_REGION>
+nohup find /mnt/lustre/nt -type f -print0 | xargs -0 -n 50 -P 8 sudo lfs hsm_restore &
 ```
 
-## Running BLAST Jobs
+### 4. Query bucket and Batch
 
-### Automated (Recommended)
+See QUICKSTART step 4. `QueryS3Key` defaults to `queries/query.fasta`. Results land in
+`s3://<query-bucket>/results/<scenario>/results-<timestamp>.out` (pass 1 output).
+
+### 5. Run and read the results
 
 ```bash
-./run_tests.sh
+./run_tests.sh                    # or ./run_tests.sh efs
+./analyze_performance.py --region $AWS_REGION --project $PROJECT_NAME [--run <timestamp>] [--json out.json]
 ```
 
-### Manual Execution
+Each job prints machine-readable lines to CloudWatch Logs:
 
-#### EFS Scenario
-```bash
-JOB_QUEUE=$(aws cloudformation describe-stacks \
-  --stack-name blast-perf-test-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobQueueEFSArn`].OutputValue' \
-  --output text --region <YOUR_REGION>)
-
-JOB_DEF=$(aws cloudformation describe-stacks \
-  --stack-name blast-perf-test-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobDefinitionEFS`].OutputValue' \
-  --output text --region <YOUR_REGION>)
-
-aws batch submit-job \
-  --job-name blast-efs-test-$(date +%Y%m%d-%H%M%S) \
-  --job-queue $JOB_QUEUE \
-  --job-definition $JOB_DEF \
-  --region <YOUR_REGION>
+```
+METRIC scenario=lustre job=<id>
+METRIC instance_type=r6id.12xlarge
+METRIC db_setup_seconds=1830 (lustre hydration via vmtouch -t)      # efs: 0 ; s3: download, with db_bytes and mbps
+METRIC pass=1 blast_seconds=2210 rows=92467 sha256=3f1c...          # cold
+METRIC pass=2 blast_seconds=2190 rows=92467 sha256=3f1c...          # warm (== cold for nt, since nt > RAM)
+METRIC total_seconds=4120
 ```
 
-#### Lustre Scenario
-```bash
-JOB_QUEUE=$(aws cloudformation describe-stacks \
-  --stack-name blast-perf-test-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobQueueLustreArn`].OutputValue' \
-  --output text --region <YOUR_REGION>)
+What to compare:
 
-JOB_DEF=$(aws cloudformation describe-stacks \
-  --stack-name blast-perf-test-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobDefinitionLustre`].OutputValue' \
-  --output text --region <YOUR_REGION>)
+- `db_setup_seconds`: the one-time cost of filling the storage layer for this instance.
+- `pass=1 blast_seconds`: storage-bound search time. For nt this is the number that ranks the
+  three layers.
+- `pass=2`: for a DB that fits in RAM (core_nt) all three scenarios should converge here; for nt it
+  equals pass 1 and shows the storage layer again.
+- `sha256`: the sorted-output hash must be identical across scenarios and runs. If it is not, the
+  DBs are not the same snapshot (compare `SOURCE_PREFIX` on EFS and in the S3 copy).
 
-aws batch submit-job \
-  --job-name blast-lustre-test-$(date +%Y%m%d-%H%M%S) \
-  --job-queue $JOB_QUEUE \
-  --job-definition $JOB_DEF \
-  --region <YOUR_REGION>
-```
-
-#### S3 Scenario
-```bash
-JOB_QUEUE=$(aws cloudformation describe-stacks \
-  --stack-name blast-perf-test-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobQueueS3Arn`].OutputValue' \
-  --output text --region <YOUR_REGION>)
-
-JOB_DEF=$(aws cloudformation describe-stacks \
-  --stack-name blast-perf-test-batch \
-  --query 'Stacks[0].Outputs[?OutputKey==`JobDefinitionS3`].OutputValue' \
-  --output text --region <YOUR_REGION>)
-
-aws batch submit-job \
-  --job-name blast-s3-test-$(date +%Y%m%d-%H%M%S) \
-  --job-queue $JOB_QUEUE \
-  --job-definition $JOB_DEF \
-  --region <YOUR_REGION>
-```
-
-## Monitoring
-
-### Check Job Status
-```bash
-aws batch describe-jobs --jobs <JOB_ID> --region <YOUR_REGION>
-```
-
-### CloudWatch Logs
-```bash
-# EFS
-aws logs tail /blast-perf-test/batch/efs --follow --region <YOUR_REGION>
-
-# Lustre
-aws logs tail /blast-perf-test/batch/lustre --follow --region <YOUR_REGION>
-
-# S3
-aws logs tail /blast-perf-test/batch/s3 --follow --region <YOUR_REGION>
-```
+Run each scenario at least twice; cloud storage throughput varies run to run (burst credits on
+Lustre, EFS and S3 request-rate ramp-up).
 
 ## Troubleshooting
 
-### 1. Batch Jobs Stuck in RUNNABLE State
+### Jobs stay in RUNNABLE
 
-**Symptom**: 
-```
-MISCONFIGURATION:JOB_RESOURCE_REQUIREMENT - The job resource requirement (vCPU/memory/GPU) 
-is higher than that can be met by the CE(s) attached to the job queue.
-```
+`aws batch describe-jobs ... --query 'jobs[].statusReason'`
 
-**Causes**: 
-- Regional capacity shortage for specific instance types
-- Job Definition vCPU requirements too high
+- `MISCONFIGURATION:JOB_RESOURCE_REQUIREMENT`: `JobVcpus`/`JobMemoryMiB` exceed every instance type
+  in `InstanceTypes`. 48 / 370,000 fits a 12xlarge; do not request the full 384 GiB.
+- No reason, compute environment stays at 0 instances: EC2 On-Demand R-instance vCPU quota too low
+  (48 vCPU per concurrent job), or the instance types are not offered in the region/AZ
+  (`aws ec2 describe-instance-type-offerings --location-type availability-zone --filters Name=instance-type,Values=r6id.12xlarge`).
+  Check `aws batch describe-compute-environments --query 'computeEnvironments[].{n:computeEnvironmentName,s:status,r:statusReason}'`.
+- Spot: not used by default. If you switch a compute environment to `SPOT`, add `spotIamFleetRole`
+  and expect interruptions during a 1-2 h job.
 
-**Solutions**:
+### Job fails immediately
 
-1. **Change instance type to optimal** (recommended):
-```yaml
-ComputeResources:
-  InstanceTypes:
-    - optimal
-```
+- `aws: command not found`: the image has no AWS CLI. Keep `BlastImage` on the ElasticBLAST image or
+  build your own with awscli.
+- `No such file or directory: /mnt/nvme` or `No space left on device` in the `s3` scenario: the
+  launch template did not run or the instance has no instance store. Check the instance's console
+  output / `lsblk`; the pool must be d-type.
+- `BLAST Database error: No alias or index file found for nucleotide database [/mnt/efs/nt/nt]`:
+  staging is incomplete or the DB name differs between stacks. Verify the SSM status parameter and
+  `ls /mnt/efs/nt | head` from the staging host (start it with `aws ec2 start-instances`).
+- Lustre: `mount.lustre: ... Input/output error` or empty `/mnt/lustre`: security group 988 missing,
+  compute in a different subnet than the file system (it is single-AZ; the Lustre compute environment
+  is pinned to private subnet 1 for this reason), or `AutoImportPolicy` not applied. Check
+  `aws fsx describe-file-systems --query 'FileSystems[].LustreConfiguration.DataRepositoryConfiguration'`.
 
-2. **Reduce vCPU requirements**:
-```yaml
-# In Job Definition
-Vcpus: 32  # Gradually reduce: 96 → 48 → 32
-```
+### Staging never completes
 
-3. **Add multiple instance types**:
-```yaml
-InstanceTypes:
-  - r5.8xlarge
-  - r5d.8xlarge
-  - r5.12xlarge
-  - r5d.12xlarge
-```
+- `aws logs tail /${PROJECT_NAME}/efs/db-staging` shows `fatal error: ... 403` on
+  `s3://ncbi-blast-databases`: the instance role needs `s3:GetObject`/`s3:ListBucket` on that bucket
+  (included) and an egress path to S3 (NAT or the gateway endpoint, both included).
+- Status parameter missing: the role has `ssm:PutParameter` scoped to `/<project>/*`; a different
+  `ProjectName` than the one used in the network stack breaks the `ImportValue`s and the scope.
 
-4. **Use SPOT instances**:
-```yaml
-ComputeResources:
-  Type: SPOT
-  BidPercentage: 100
-```
+### Lustre first pass is slow
 
-### 2. Lustre Mount Failure
+SCRATCH_2 throughput is proportional to capacity: 200 MB/s per TiB baseline (2,400 GiB -> ~470 MB/s),
+with bursts to 1,300 MB/s per TiB from network credits. A 1.2 TB first read at baseline is ~42 min.
+For sustained throughput use `PERSISTENT_2` with 500 or 1,000 MB/s per TiB (change `DeploymentType`
+and add `PerUnitStorageThroughput`; price $0.34 / $0.60 per GB-month), or increase capacity.
 
-**Symptom**: Job starts but Lustre mount fails
-
-**Solution**: 
-- Fix Lustre mount command in 04-batch-environment.yaml
-- Add LustreFileSystemId and LustreMountName to Parameters
-
-### 3. EC2 Instances Not Starting
-
-**Check**:
-```bash
-# Compute Environment status
-aws batch describe-compute-environments \
-  --region <YOUR_REGION> \
-  --query 'computeEnvironments[*].{Name:computeEnvironmentName,Status:status,DesiredvCpus:computeResources.desiredvCpus}'
-
-# Instance type availability
-aws ec2 describe-instance-type-offerings \
-  --location-type availability-zone \
-  --filters Name=instance-type,Values=r5.12xlarge \
-  --region <YOUR_REGION>
-```
-
-**Solutions**:
-- Use different region (us-east-1, us-west-2)
-- Use SPOT instances
-- Use optimal instance type
-
-### 4. Job Queue References Old Compute Environment
-
-**Check**:
-```bash
-aws batch describe-job-queues \
-  --job-queues <QUEUE_NAME> \
-  --region <YOUR_REGION> \
-  --query 'jobQueues[0].computeEnvironmentOrder[*].computeEnvironment'
-```
-
-**Solution**: 
-- Cancel existing jobs and resubmit
-- Wait for CloudFormation stack update to complete
-
-## Resource Cleanup
+## Cleanup
 
 ```bash
-# Delete in reverse order
-aws cloudformation delete-stack --stack-name blast-perf-test-batch --region <YOUR_REGION>
-aws cloudformation delete-stack --stack-name blast-perf-test-lustre --region <YOUR_REGION>
-aws cloudformation delete-stack --stack-name blast-perf-test-efs --region <YOUR_REGION>
-aws cloudformation delete-stack --stack-name blast-perf-test-network --region <YOUR_REGION>
-
-# Delete S3 buckets
-aws s3 rb s3://$QUERY_BUCKET --force --region <YOUR_REGION>
-aws s3 rb s3://blast-nt-lustre-<REGION>-${ACCOUNT_ID} --force --region <YOUR_REGION>
+./cleanup.sh
 ```
 
-## Cost Optimization Tips
+or delete `${PROJECT_NAME}-batch`, `-lustre`, `-efs`, `-network` in that order, then the two buckets
+(`${PROJECT_NAME}-queries-<account>`, `blast-nt-lustre-<account>`). The staging instances belong to
+their stacks and are deleted with them.
 
-1. **Use SPOT instances**: Up to 90% cost savings
-2. **Delete resources immediately after job completion**
-3. **Delete EFS/Lustre when not in use**
-4. **Watch NAT Gateway costs**: Hourly charges apply
+## Cost notes
 
-## Expected Performance
-
-| Scenario | DB Load Time | BLAST Execution | Total Time |
-|----------|-------------|-----------------|------------|
-| EFS | 0s | 15-20 min | 15-20 min |
-| Lustre | 0s | 10-15 min | 10-15 min |
-| S3 | 30-60 min | 10-15 min | 40-75 min |
-
-## Key Lessons Learned
-
-1. **Check regional capacity**: Verify instance type availability before deployment
-2. **Use optimal instance type**: More flexible than specifying specific types
-3. **Gradual vCPU reduction**: Adjust 96 → 48 → 32 incrementally
-4. **Validate CloudFormation parameters**: Watch for missing Lustre parameters
-5. **Wait for stack updates**: Prevent referencing old Compute Environments
-
-## References
-
-- [AWS Batch Documentation](https://docs.aws.amazon.com/batch/)
-- [Amazon EFS Performance](https://docs.aws.amazon.com/efs/latest/ug/performance.html)
-- [FSx for Lustre Performance](https://docs.aws.amazon.com/fsx/latest/LustreGuide/performance.html)
-- [NCBI BLAST Documentation](https://blast.ncbi.nlm.nih.gov/doc/blast-help/)
+See the README cost table. In short: EFS storage $0.30/GB-mo plus $0.06/GB written and $0.03/GB read
+(the reads make each cold nt pass about $35); FSx SCRATCH_2 $0.14/GB-mo billed hourly for the
+provisioned size; S3 copy $0.023/GB-mo; compute $3.6/h per 12xlarge while a job runs. Tear down the
+storage between benchmark rounds.
