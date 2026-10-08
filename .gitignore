@@ -1,5 +1,6 @@
-# Logs
+# Logs and the job-id ledger written by run_tests.sh
 *.log
+.runs.log
 
 # AWS credentials
 .aws/
@@ -12,7 +13,6 @@
 
 # CloudFormation outputs
 outputs/
-*.json
 
 # Temporary files
 tmp/
@@ -50,7 +50,6 @@ data/*.bam
 data/*.vcf
 
 # Large temporary files
-t
 *.tmp.large
 
 # Backup files

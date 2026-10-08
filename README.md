@@ -106,10 +106,19 @@ download for NVMe).
 | Method | What it is the answer to | What the benchmark tells you | Known limits going in |
 |---|---|---|---|
 | **S3 -> local NVMe** (baseline) | "No shared storage at all": every instance stages its own copy. This is ElasticBLAST's model and the cheapest standing cost. | Per-instance staging time and MB/s; NVMe read throughput during the cold pass. Amortised over the jobs one instance serves (`.done` marker lets later jobs on the same instance skip the download). | Pays the full download on every new instance (and every Spot replacement); 1.2 TB at 18.75 Gbit/s is at least ~9 minutes. |
-| **EFS** | "Simplest shared POSIX file system": no capacity planning, multi-AZ, mounted by ECS natively. | Whether a single NFS client's cap (1,500 MiB/s with efs-utils 2.x) and the Elastic-throughput read charge are acceptable for a streaming scan of the DB. | $0.03/GB read means every cold pass over nt costs about **$35** in EFS reads alone; the per-client cap puts a floor of ~12.4 min under a full 1,170 GB scan. Fits small DBs (tens of GB) that then live in RAM. |
+| **EFS** | "Simplest shared POSIX file system": no capacity planning, multi-AZ, mounted by ECS natively. | Whether a single NFS client's cap (1,500 MiB/s with efs-utils 2.x) and the Elastic-throughput read charge are acceptable for a streaming scan of the DB. | **Disqualified at nt scale by its price structure, before any measurement:** $0.03/GB read means every cold pass over nt costs about **$35** in EFS reads alone, and because nt (1,170 GB to cache) cannot stay in RAM on any R instance, *every* pass is cold; the per-client cap (about 1,500 MiB/s) puts a floor of about 12 min under a full scan, and adding nodes does not raise the per-node cap. Suited to DBs of tens of GB that are read into RAM once. |
 | **FSx for Lustre** | "Shared parallel file system for many concurrent nodes": HPC standard, S3-linked, no per-read charge, throughput scales with provisioned size. | Hydration time from S3 on first touch, then steady-state read throughput against many clients; whether 2,400 GiB SCRATCH_2 (about 470 MB/s baseline, bursts to about 3 GB/s) keeps up with a 48-thread blastn. | Single AZ; billed hourly for provisioned capacity whether used or not; a 1,200 GiB file system would be 93 % full with nt and too slow (234 MB/s baseline). |
 
-Which one wins depends on how many jobs share one copy of the database before it is thrown away:
+EFS is kept in the matrix so the three storage classes are compared on the same footing, but its
+verdict for `nt` does not depend on the measurement: at $0.03/GB a workload of 2,000 searches a day
+would pay about $70,000 a day in EFS reads alone, and the Bursting/Provisioned modes that remove the
+read charge give either about 60 MiB/s at 1.2 TB stored (a 5-hour scan) or 500 MiB/s for about
+$3,000 a month. **Run the `efs` scenario only with `core_nt` or a small DB** (`BlastDbName=core_nt`
+or the [small-DB variant](#small-db-variant-targeted-screening) below); against nt it adds about
+$140 of staging writes and reads to a round and answers a question the price list already settled.
+
+Which one wins between the remaining two depends on how many jobs share one copy of the database
+before it is thrown away:
 a daily cadence of thousands of jobs over `nt` favours a shared file system; a few large batch
 searches a month favour per-instance NVMe (or ElasticBLAST). This repository exists to put numbers on
 that trade-off instead of guessing.
@@ -178,6 +187,37 @@ Limits to know before raising N:
   an instance that is still alive. Per-scenario cost grows linearly with N (about $3.6/h per
   instance); for EFS add $35 of reads per job and cold pass over nt.
 
+## Small-DB variant (targeted screening)
+
+The same four templates measure the other common case: a reference DB of tens of GB that is
+scanned by many small jobs (clinical or targeted screening against `ref_prok_rep_genomes`,
+`16S_ribosomal_RNA`, a custom panel). The DB fits in RAM, so pass 2 is identical everywhere and the
+benchmark reduces to **staging time and cost per storage class**: how long until the first job can
+start, and what one job costs on each path. Only the DB name and the instance pool change
+(parameter names exactly as in the templates):
+
+| Stack | Parameters |
+|---|---|
+| `02-efs-storage.yaml` | `BlastDbName=ref_prok_rep_genomes` (26.7 GB; `StagingInstanceType=m6i.large` is enough) |
+| `03-lustre-storage.yaml` | `BlastDbName=ref_prok_rep_genomes` `LustreStorageCapacity=1200` |
+| `04-batch-environment.yaml` | `BlastDbName=ref_prok_rep_genomes` `InstanceTypes=r6id.4xlarge,r5d.4xlarge` `JobVcpus=16` `JobMemoryMiB=120000` |
+
+```bash
+aws cloudformation deploy --stack-name ${PROJECT_NAME}-batch --template-file 04-batch-environment.yaml \
+  --capabilities CAPABILITY_IAM --region $AWS_REGION --parameter-overrides ProjectName=$PROJECT_NAME \
+  BlastDbName=ref_prok_rep_genomes InstanceTypes=r6id.4xlarge,r5d.4xlarge JobVcpus=16 JobMemoryMiB=120000 \
+  QueryS3Bucket=$QUERY_BUCKET LustreFileSystemId=$LUSTRE_FS_ID LustreMountName=$LUSTRE_MOUNT
+```
+
+r6id.4xlarge / r5d.4xlarge (16 vCPU, 128 GiB, local NVMe, about $1.2 / $1.15 per hour) hold the
+26.7 GB DB in the page cache with room to spare; `JobMemoryMiB=120000` stays below what the ECS agent
+reports as available on a 128 GiB instance. With `MaxvCpus: 384` unchanged, `--concurrency` can go up
+to 24 jobs per queue. Staging takes minutes instead of hours (EFS writes about $1.6, Lustre
+hydration a few seconds), the three jobs run in well under an hour, and a complete round (deploy,
+stage, three scenarios, tear down the same day) costs about **$10**, dominated by the FSx 1,200 GiB
+hour-rounded charge and the NAT Gateway hours. This is the configuration in which EFS is a
+legitimate contender, and the one to use to compare EFS $/job against the other two.
+
 ## Cost
 
 List prices, us-east-1, read from the AWS Price List API on 2026-10-08. The benchmark should be run
@@ -199,7 +239,8 @@ services are priced, and per day because that is how long you should keep them.
 | Batch r6id.12xlarge / r5d.12xlarge | $3.63 / $3.46 /h | ~1-2 h per scenario | ~$12-25 per round of 3 |
 
 One complete round (deploy, stage, three jobs, tear down inside 24 h) is roughly **$150-200**,
-of which EFS staging writes + two EFS cold passes are about $140. Leaving everything up costs
+of which EFS staging writes + two EFS cold passes are about $140 (running the `efs` scenario only
+with `core_nt` or the small-DB variant, as recommended above, brings a round to roughly $60). Leaving everything up costs
 about **$760 per month** plus any staging instance you forget to stop (the templates now stop them
 automatically; the original r5d.24xlarge staging hosts would have cost $5,000 per month each).
 
