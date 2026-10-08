@@ -293,6 +293,8 @@ Resources:
             echo "METRIC blast_version=$(blastn -version | head -1 | awk '{print $2}')"
             aws s3 cp "s3://$QUERY_S3_BUCKET/$QUERY_S3_KEY" /tmp/query.fasta
             echo "METRIC db_setup_seconds=0 (pre-staged)"
+            # taxdb.* sits next to the DB files; BLAST only finds it through BLASTDB, not the -db path.
+            export BLASTDB="$(dirname "$DB_PATH")"
             blastdbcmd -db "$DB_PATH" -info > /tmp/dbinfo.txt; head -4 /tmp/dbinfo.txt
             for p in $(seq 1 "$PASSES"); do
               P0=$(date +%s)
@@ -417,6 +419,11 @@ Resources:
             echo "METRIC instance_type=$(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || echo unknown)"
             echo "METRIC blast_version=$(blastn -version | head -1 | awk '{print $2}')"
             aws s3 cp "s3://$QUERY_S3_BUCKET/$QUERY_S3_KEY" /tmp/query.fasta
+            # Fail fast if the host did not mount FSx: an unmounted /mnt/lustre is an empty
+            # directory and would otherwise surface as a confusing "No alias or index file" error.
+            FSTYPE=$(stat -f -c %T /mnt/lustre 2>/dev/null || echo none)
+            if [ "$FSTYPE" != "lustre" ]; then echo "ERROR /mnt/lustre is not a Lustre mount (fstype=$FSTYPE); check the launch template user data" >&2; exit 3; fi
+            if [ ! -d "$(dirname "$DB_PATH")" ]; then echo "ERROR $(dirname "$DB_PATH") not present on FSx yet: the S3 copy may not have finished or auto-import is still catching up (ls /mnt/lustre: $(ls /mnt/lustre | tr "\n" " "))" >&2; exit 4; fi
             # Lustre lazy-loads file contents from S3 on first access. Pre-reading the DB
             # files with vmtouch (-t = touch into memory) makes the S3->Lustre hydration a
             # separately measured step; pass 1 then measures Lustre->client throughput.
@@ -425,6 +432,8 @@ Resources:
               | parallel --will-cite -0 -j 16 vmtouch -tq {} || true
             H1=$(date +%s)
             echo "METRIC db_setup_seconds=$((H1 - H0)) (lustre hydration via vmtouch -t)"
+            # taxdb.* sits next to the DB files; BLAST only finds it through BLASTDB, not the -db path.
+            export BLASTDB="$(dirname "$DB_PATH")"
             blastdbcmd -db "$DB_PATH" -info > /tmp/dbinfo.txt; head -4 /tmp/dbinfo.txt
             for p in $(seq 1 "$PASSES"); do
               P0=$(date +%s)
@@ -572,6 +581,8 @@ Resources:
             SECS=$((D1 - D0)); [ "$SECS" -eq 0 ] && SECS=1
             echo "METRIC db_setup_seconds=$((D1 - D0)) db_bytes=$BYTES mbps=$(( BYTES / 1000000 / SECS ))"
             aws s3 cp "s3://$QUERY_S3_BUCKET/$QUERY_S3_KEY" /tmp/query.fasta
+            # taxdb.* sits next to the DB files; BLAST only finds it through BLASTDB, not the -db path.
+            export BLASTDB="$(dirname "$DB_PATH")"
             blastdbcmd -db "$DB_PATH" -info > /tmp/dbinfo.txt; head -4 /tmp/dbinfo.txt
             for p in $(seq 1 "$PASSES"); do
               P0=$(date +%s)

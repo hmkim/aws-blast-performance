@@ -49,6 +49,10 @@ Resources:
     Type: AWS::FSx::FileSystem
     Properties:
       FileSystemType: LUSTRE
+      # SCRATCH_2 defaults to Lustre 2.10, which the Amazon Linux 2023 client (2.15) cannot
+      # mount: "Server MGS version (2.10.5.0) refused connection from this client with an
+      # incompatible version (2.15.6)". 2.15 is mountable by AL2 (2.12 client) and AL2023.
+      FileSystemTypeVersion: '2.15'
       StorageCapacity: !Ref LustreStorageCapacity
       SubnetIds:
         - !ImportValue 
@@ -150,6 +154,27 @@ Resources:
       # NOTE: Fn::Sub template - shell variables are written as $VAR (no braces).
       UserData:
         Fn::Base64: !Sub |
+          Content-Type: multipart/mixed; boundary="//"
+          MIME-Version: 1.0
+
+          --//
+          Content-Type: text/cloud-config; charset="us-ascii"
+          MIME-Version: 1.0
+          Content-Transfer-Encoding: 7bit
+          Content-Disposition: attachment; filename="cloud-config.txt"
+
+          #cloud-config
+          # Run the user-data script on every boot (a CloudFormation UserData update stops and
+          # starts the same instance; without this the new script would never run).
+          cloud_final_modules:
+          - [scripts-user, always]
+
+          --//
+          Content-Type: text/x-shellscript; charset="us-ascii"
+          MIME-Version: 1.0
+          Content-Transfer-Encoding: 7bit
+          Content-Disposition: attachment; filename="userdata.txt"
+
           #!/bin/bash
           set -euo pipefail
 
@@ -178,35 +203,71 @@ Resources:
           exec > >(tee -a /var/log/db-s3-copy.log) 2>&1
 
           DB=${BlastDbName}
-          LATEST=$(aws s3 cp s3://ncbi-blast-databases/latest-dir - --region us-east-1)
-          SRC=s3://ncbi-blast-databases/$LATEST/
+          REGION=${AWS::Region}
+          SRC_REGION=us-east-1          # s3://ncbi-blast-databases lives here
           DEST=s3://${S3Bucket}/$DB/
-          echo "$(date -u +%FT%TZ) server-side copy $DB from $SRC to $DEST"
+          LATEST=unknown
+          STATUS=failed
+          T0=$(date +%s)
+
+          # Whatever happens below, leave a status for run_tests.sh and stop this instance.
+          # Cost guard: the host has no further purpose once the copy is done or has failed.
+          finish() {
+            aws ssm put-parameter \
+              --name "/${ProjectName}/lustre/db-s3-copy-status" \
+              --value "$STATUS:$DB:$LATEST:$(( $(date +%s) - T0 ))s" \
+              --type String --overwrite --region $REGION || true
+            sleep 60    # let the CloudWatch agent flush
+            shutdown -h now
+          }
+          trap finish EXIT
+
+          LATEST=$(aws s3 cp s3://ncbi-blast-databases/latest-dir - --region $SRC_REGION)
+          SRC=s3://ncbi-blast-databases/$LATEST/
+
+          # Idempotency: a previous boot may already have finished this copy.
+          if [ "$(aws s3 cp $DEST/SOURCE_PREFIX - --region $REGION 2>/dev/null || true)" = "$LATEST" ]; then
+            echo "$(date -u +%FT%TZ) $DEST already holds $DB from $LATEST -- nothing to copy"
+            STATUS=completed
+            exit 0
+          fi
 
           # NCBI stores unpacked volume files under a dated prefix; copy only this DB.
-          # The source bucket is in us-east-1; cross-region copies incur data transfer charges.
           aws configure set default.s3.max_concurrent_requests 32
-          T0=$(date +%s)
-          aws s3 sync $SRC $DEST \
-            --source-region us-east-1 --region ${AWS::Region} --only-show-errors \
-            --exclude "*" \
-            --include "$DB.*" \
-            --include "$DB-nucl-metadata.json" \
-            --include "taxdb.*"
+          if [ "$REGION" = "$SRC_REGION" ]; then
+            # Same region: server-side copy. No bytes pass through this host and the S3 gateway
+            # endpoint makes it free of NAT charges.
+            echo "$(date -u +%FT%TZ) server-side copy $DB from $SRC to $DEST"
+            aws s3 sync $SRC $DEST --region $REGION --only-show-errors \
+              --exclude "*" --include "$DB.*" --include "$DB-nucl-metadata.json" --include "taxdb.*"
+          else
+            # Other region: a server-side CopyObject whose source is in another region is rejected
+            # by the S3 gateway endpoint ("VPC endpoints do not support cross-region requests"),
+            # so stream each object through this host instead. Bytes leave us-east-1 at the
+            # inter-region rate and enter here through the NAT gateway (~$0.045/GB) -- the reason
+            # README recommends running the nt benchmark in us-east-1.
+            echo "$(date -u +%FT%TZ) cross-region stream copy $DB from $SRC ($SRC_REGION) to $DEST ($REGION)"
+            aws s3api list-objects-v2 --bucket ncbi-blast-databases --prefix "$LATEST/" \
+              --region $SRC_REGION --query 'Contents[].Key' --output text | tr '\t' '\n' \
+              | grep -E "/($DB\.[A-Za-z0-9.]+|$DB-nucl-metadata\.json|taxdb\..*)$" > /tmp/keys.txt
+            echo "$(wc -l < /tmp/keys.txt) objects to copy"
+            cat > /tmp/copy_one.sh <<'EOS'
+          #!/bin/bash
+          set -euo pipefail
+          KEY="$1"; SRC_REGION="$2"; DEST="$3"; REGION="$4"
+          SIZE=$(aws s3api head-object --bucket ncbi-blast-databases --key "$KEY" --region "$SRC_REGION" --query ContentLength --output text)
+          aws s3 cp "s3://ncbi-blast-databases/$KEY" - --region "$SRC_REGION" --only-show-errors \
+            | aws s3 cp - "$DEST$(basename "$KEY")" --region "$REGION" --only-show-errors --expected-size "$SIZE"
+          EOS
+            chmod +x /tmp/copy_one.sh
+            xargs -a /tmp/keys.txt -P 8 -I{} /tmp/copy_one.sh {} "$SRC_REGION" "$DEST" "$REGION"
+          fi
           T1=$(date +%s)
           echo "$(date -u +%FT%TZ) copy finished in $((T1 - T0)) seconds"
-          echo "$LATEST" | aws s3 cp - $DEST/SOURCE_PREFIX --region ${AWS::Region}
-          aws s3 ls $DEST --recursive --summarize --region ${AWS::Region} | tail -2
-
-          aws ssm put-parameter \
-            --name "/${ProjectName}/lustre/db-s3-copy-status" \
-            --value "completed:$DB:$LATEST:$((T1 - T0))s" \
-            --type String --overwrite --region ${AWS::Region} || true
-
-          # Cost guard: this instance has no further purpose. Give the CloudWatch agent
-          # time to flush, then stop (not terminate - the stack still owns it).
-          sleep 60
-          shutdown -h now
+          echo "$LATEST" | aws s3 cp - $DEST/SOURCE_PREFIX --region $REGION
+          aws s3 ls $DEST --recursive --summarize --region $REGION | tail -2
+          STATUS=completed
+          --//--
 
       Tags:
         - Key: Name

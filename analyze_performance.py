@@ -139,9 +139,11 @@ def main():
     for m in results["s3"].values():
         if str(m.get("db_bytes", "")).isdigit():
             db_bytes = int(m["db_bytes"])
+    assumed = ""
     if db_bytes is None:
         db_bytes = int(a.db_gb * 1e9)
-    print(f"\nconcurrency (DB bytes per cold pass = {db_bytes / 1e9:,.0f} GB)")
+        assumed = f", ASSUMED from --db-gb because no s3 job in this run reported db_bytes"
+    print(f"\nconcurrency (DB bytes per cold pass = {db_bytes / 1e9:,.2f} GB{assumed})")
     print(f"{'scenario':<8} {'jobs':>4} {'wall_p50_s':>10} {'wall_p95_s':>10} {'cold_p50_s':>10} {'cold_p95_s':>10} {'window_s':>8} {'aggregate_MB/s':>14}")
     for s in SCENARIOS:
         jobs = [m for m in results[s].values() if 1 in m["passes"]]
@@ -164,8 +166,8 @@ def main():
         for s in ("efs", "lustre"):
             if summary.get(s):
                 setup, p1, p2, _ = summary[s][-1]
-                print(f"  {s:<6}: db_setup {setup}s + cold pass {p1}s = {setup + p1}s "
-                      f"({(b_setup + b_p1) / max(setup + p1, 1):.2f}x of baseline time)"
+                ratio = f"{(setup + p1) / (b_setup + b_p1):.2f}x of baseline time" if (b_setup + b_p1) > 0 else "baseline took 0 s, ratio n/a"
+                print(f"  {s:<6}: db_setup {setup}s + cold pass {p1}s = {setup + p1}s ({ratio})"
                       + (f", warm pass {p2}s" if p2 else ""))
 
     if a.json:

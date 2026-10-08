@@ -39,17 +39,21 @@ stack_output() {
 }
 
 # Refuse to run before the DBs are staged (both stacks write an SSM parameter when done).
+# The parameter outlives its stack, so the DB name inside the signal must match the Batch
+# stack's BlastDbName -- a stale "completed:<other db>" from an earlier deployment does not count.
 staging_status() {
   aws ssm get-parameter --name "$1" --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || echo "missing"
 }
+EXPECTED_DB=$(aws cloudformation describe-stacks --stack-name "${PROJECT_NAME}-batch" --region "$REGION" \
+  --query "Stacks[0].Parameters[?ParameterKey=='BlastDbName'].ParameterValue" --output text)
 for s in "${SCENARIOS[@]}"; do
   case $s in
     efs)    st=$(staging_status "/${PROJECT_NAME}/efs/db-staging-status") ;;
     lustre|s3) st=$(staging_status "/${PROJECT_NAME}/lustre/db-s3-copy-status") ;;
     *) echo "unknown scenario: $s" >&2; exit 1 ;;
   esac
-  echo "staging status for $s: $st"
-  case $st in completed*) ;; *) echo "DB for scenario '$s' is not staged yet - aborting" >&2; exit 1 ;; esac
+  echo "staging status for $s: $st (batch stack expects DB '$EXPECTED_DB')"
+  case $st in "completed:${EXPECTED_DB}:"*) ;; *) echo "DB '$EXPECTED_DB' for scenario '$s' is not staged yet (signal: $st) - aborting" >&2; exit 1 ;; esac
 done
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)

@@ -133,6 +133,8 @@ details and troubleshooting.
 export AWS_REGION=us-east-1 PROJECT_NAME=blast-perf-test
 # 1. network (5 min)      2. EFS + staging (2-3 h for nt)      3. Lustre + S3 copy (1-2 h for nt)
 # 4. query bucket + Batch (5 min)   5. ./run_tests.sh   6. ./analyze_performance.py   7. ./cleanup.sh
+# To benchmark a different DB do not just change BlastDbName on the deployed stacks: delete stacks
+# 04, 03, 02 (in that order) and create them again ("What was verified", #15 explains why).
 ```
 
 Smoke-test the whole pipeline first with a small database
@@ -282,6 +284,29 @@ Checked against the live NCBI bucket, AWS documentation, `cfn-lint` and `aws clo
 
 Also verified: `r6id.12xlarge`, `r5d.12xlarge`, `r6id.24xlarge`, `r5d.24xlarge` are offered in both
 us-east-1 and ap-northeast-2; on-demand us-east-1 $3.6288 / $3.4560 / $7.2576 / $6.9120 per hour.
+
+### Smoke-tested end to end (2026-10-09, ap-northeast-2, `ref_viruses_rep_genomes`, 346 MB)
+
+The four stacks were deployed, the three scenarios run, and everything torn down again, in a region
+other than us-east-1 (the us-east-1 Elastic IP quota of the test account was exhausted by other
+projects' NAT gateways). Running outside the NCBI bucket's region exposed defects that static
+validation could not:
+
+| # | What happened | Cause | Fix in this repository |
+|---|---|---|---|
+| 13 | Lustre copy host: `CopyObject ... AccessDenied: VPC endpoints do not support cross-region requests` for every object | A server-side S3 copy whose source bucket is in another region is refused by the S3 gateway endpoint. | `03`: same region -> server-side `aws s3 sync`; other region -> each object is streamed through the host (`aws s3 cp` to stdout piped into `aws s3 cp` from stdin, 8 in parallel). 14 objects / 346 MB in 31 s. |
+| 14 | After the failed copy the host kept running with no status signal (`set -e` aborted the script before `shutdown`). | No failure path. | `02`/`03`: `trap ... EXIT` always writes `completed:`/`failed:` to SSM and stops the instance. |
+| 15 | A CloudFormation `UserData` change is applied as stop -> modify -> start of the **same** instance, and cloud-init runs plain user data once per instance id, so the edited script never ran. | cloud-init per-instance semantics. | `02`/`03`: user data wrapped in a cloud-init multipart with `cloud_final_modules: [scripts-user, always]`. Caveat: a **parameter-only** change (e.g. `BlastDbName`) is still re-run with the *cached* user data, so to switch databases delete and recreate stacks 02-04 (see Quick start). |
+| 16 | Batch jobs: `/mnt/lustre is not a Lustre mount (fstype=xfs)`; host console: `Server MGS version (2.10.5.0) refused connection from this client with an incompatible version (2.15.6)`. | SCRATCH_2 file systems default to **Lustre 2.10**; the Amazon Linux 2023 `lustre-client` is 2.15 and cannot mount them. | `03`: `FileSystemTypeVersion: '2.15'`. An existing file system was upgraded in place (`FILE_SYSTEM_UPDATE`, 25 min, same id and mount name). |
+| 17 | (latent) Lustre security group allowed only TCP 988. | LNet also needs 1018-1023 and opens connections back to clients. | `01`: 988 + 1018-1023 on the file-system SG from the client SG and itself, and on the client SG from the file-system SG. |
+| 18 | `Warning: [blastn] Taxonomy name lookup from taxid requires installation of taxdb` three times per pass; `sscinames` empty. | `taxdb.*` sits next to the DB files, but BLAST looks it up through `BLASTDB`, not the `-db` path. | `04`: `export BLASTDB` set to the DB directory in all three jobs. |
+| 19 | A mount failure surfaced only as `No alias or index file found`. | Jobs did not check the mount. | `04` lustre job: exit 3 if `/mnt/lustre` is not of type `lustre`, exit 4 if the DB directory is missing (prints `ls /mnt/lustre`). |
+| 20 | `analyze_performance.py` printed the nt default (1,170 GB) silently when a run had no `s3` job, and the baseline ratio was inverted. | - | DB size shown with decimals and flagged `ASSUMED`; ratio is scenario / baseline, `n/a` when the baseline took 0 s. |
+
+Measured on the smoke DB (r5d.4xlarge, `JobVcpus=16`): EFS staging 8-11 s, Lustre S3 copy 28-31 s,
+S3 -> NVMe 3 s (115 MB/s through the NAT gateway, cross-region), Lustre hydration 2 s; result hash
+identical across the three scenarios (51 rows). These are too small to say anything about
+throughput; they show that the pipeline runs and that the three paths read the same bytes.
 
 ## Project structure
 
