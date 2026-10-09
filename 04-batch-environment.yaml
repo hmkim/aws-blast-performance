@@ -72,6 +72,19 @@ Parameters:
     Default: 21600
     Description: Hard stop per job attempt (cost guard). 6 h default.
 
+  EnableEfsScenario:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Set to false to deploy without the EFS stack: no EFS compute environment, job queue,
+      job definition or log group is created and the EFS stack's export is not imported.
+      Recommended for nt, where the EFS scenario is settled by its read charge before any
+      measurement (README, "Why three methods"); then run ./run_tests.sh lustre s3.
+
+Conditions:
+  EfsEnabled: !Equals [!Ref EnableEfsScenario, 'true']
+
 Resources:
   BatchServiceRole:
     Type: AWS::IAM::Role
@@ -212,6 +225,7 @@ Resources:
   # ------------------------------------------------------------------
   ComputeEnvironmentEFS:
     Type: AWS::Batch::ComputeEnvironment
+    Condition: EfsEnabled
     Properties:
       Type: MANAGED
       ServiceRole: !GetAtt BatchServiceRole.Arn
@@ -240,6 +254,7 @@ Resources:
 
   JobQueueEFS:
     Type: AWS::Batch::JobQueue
+    Condition: EfsEnabled
     Properties:
       JobQueueName: !Sub ${ProjectName}-efs
       Priority: 1
@@ -249,6 +264,7 @@ Resources:
 
   JobDefinitionEFS:
     Type: AWS::Batch::JobDefinition
+    Condition: EfsEnabled
     Properties:
       Type: container
       JobDefinitionName: !Sub ${ProjectName}-blastn-efs
@@ -327,6 +343,7 @@ Resources:
 
   LogGroupEFS:
     Type: AWS::Logs::LogGroup
+    Condition: EfsEnabled
     Properties:
       LogGroupName: !Sub /${ProjectName}/batch/efs
       RetentionInDays: 14
@@ -619,6 +636,7 @@ Resources:
 
 Outputs:
   JobQueueEFSArn:
+    Condition: EfsEnabled
     Value: !Ref JobQueueEFS
     Export:
       Name: !Sub ${ProjectName}-job-queue-efs
@@ -634,6 +652,7 @@ Outputs:
       Name: !Sub ${ProjectName}-job-queue-s3
 
   JobDefinitionEFS:
+    Condition: EfsEnabled
     Value: !Ref JobDefinitionEFS
 
   JobDefinitionLustre:

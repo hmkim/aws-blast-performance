@@ -69,6 +69,8 @@ aws cloudformation deploy --stack-name ${PROJECT_NAME}-batch \
 
 Optional overrides: `InstanceTypes=r6id.12xlarge,r5d.12xlarge` `JobVcpus=48` `JobMemoryMiB=370000`
 `BlastPasses=2` `BlastImage=public.ecr.aws/ncbi-elasticblast/elasticblast-elb:1.4.0`.
+For `nt`, skip step 2 and pass `EnableEfsScenario=false` here (no EFS resources are created and the
+EFS stack's export is not needed), then run `./run_tests.sh lustre s3`.
 
 ## 5. Run
 

@@ -121,7 +121,11 @@ Which one wins between the remaining two depends on how many jobs share one copy
 before it is thrown away:
 a daily cadence of thousands of jobs over `nt` favours a shared file system; a few large batch
 searches a month favour per-instance NVMe (or ElasticBLAST). This repository exists to put numbers on
-that trade-off instead of guessing.
+that trade-off instead of guessing. The numbers are in, for one reader: on `nt` a cold `blastn`
+pass took **15 min from local NVMe and 2 h 19 min from FSx for Lustre** (the search faults 8 KB pages
+through `mmap` once the DB is larger than RAM, and a network file system serves those one round trip
+at a time), so the shared file system is the *staging source*, not the layer the search reads from.
+Details under [nt round](#nt-round-2026-10-09-us-east-1-nt-1223-gb-lustre-and-s3-scenarios).
 
 ## Quick start
 
@@ -141,10 +145,15 @@ Smoke-test the whole pipeline first with a small database
 (`BlastDbName=ref_viruses_rep_genomes`, 150 MB, or `16S_ribosomal_RNA`, 20 MB) and
 `LustreStorageCapacity=1200`; it costs cents and takes under an hour.
 
-## Expected behaviour (model, to be replaced by measurements)
+## Expected behaviour (model) and what the measurement said
 
 Lower bounds for `nt` (1,170 GB to cache) on r6id.12xlarge, computed from published limits.
 Actual `blastn` time is the larger of this storage floor and the CPU time for your query set.
+The measured round ([nt round](#nt-round-2026-10-09-us-east-1-nt-1223-gb-lustre-and-s3-scenarios) below)
+confirmed the S3 -> NVMe row within a factor of two and showed that the Lustre row's floor is the
+wrong quantity: `blastn` reads the volumes through `mmap`, and once nt exceeds RAM the pass is bound
+by random 8 KB page faults over the network, not by sequential throughput. The cold pass took
+15 min on NVMe and 2 h 19 min on Lustre.
 
 | Scenario | `db_setup` (fill layer 2) | Cold pass storage floor | Warm pass | Per cold pass storage cost |
 |---|---|---|---|---|
@@ -242,7 +251,8 @@ services are priced, and per day because that is how long you should keep them.
 
 One complete round (deploy, stage, three jobs, tear down inside 24 h) is roughly **$150-200**,
 of which EFS staging writes + two EFS cold passes are about $140 (running the `efs` scenario only
-with `core_nt` or the small-DB variant, as recommended above, brings a round to roughly $60). Leaving everything up costs
+with `core_nt` or the small-DB variant, as recommended above, brings a round to roughly $60; the
+measured `lustre` + `s3` round of 2026-10-09 came to about $30 at list price, 7 h end to end). Leaving everything up costs
 about **$760 per month** plus any staging instance you forget to stop (the templates now stop them
 automatically; the original r5d.24xlarge staging hosts would have cost $5,000 per month each).
 
@@ -307,6 +317,71 @@ Measured on the smoke DB (r5d.4xlarge, `JobVcpus=16`): EFS staging 8-11 s, Lustr
 S3 -> NVMe 3 s (115 MB/s through the NAT gateway, cross-region), Lustre hydration 2 s; result hash
 identical across the three scenarios (51 rows). These are too small to say anything about
 throughput; they show that the pipeline runs and that the three paths read the same bytes.
+
+### nt round (2026-10-09, us-east-1, `nt`, 1,223 GB, `lustre` and `s3` scenarios)
+
+Run in the NCBI bucket's own region once the account's Elastic IP quota had been raised, with the
+`efs` scenario left out (`EnableEfsScenario=false`, see "Why three methods"). Two more defects
+appeared only at this size and in this region:
+
+| # | What happened | Cause | Fix in this repository |
+|---|---|---|---|
+| 21 | Same-region Lustre copy host: `GetObjectTagging ... AccessDenied` for every `nt.*` volume file; the 2,686 small files (3.3 GB) copied, the database did not. Signal `failed:nt:...:43s`, host stopped itself (#14 worked). | Above the 8 MiB multipart threshold `aws s3 sync` replicates the source object's tags with `GetObjectTagging`. The copy host's role grants only `GetObject`/`ListBucket` on the NCBI bucket (#11, least privilege), so every large object failed. The cross-region path (#13) streams bytes and never calls it, which is why the smoke test in ap-northeast-2 did not show this. | `03`: `--copy-props none` on the server-side `sync` (tags and user metadata are not needed; one request per object saved). Verified on a 3 GB volume file: 17 s server-side. |
+| 22 | The Batch stack could not be deployed without the EFS stack (hard `!ImportValue` of the EFS file-system id), although the README tells you to skip `efs` for nt. | - | `04`: `EnableEfsScenario` parameter (`true` default) with a `Condition` on the EFS compute environment, queue, job definition, log group and outputs. `./run_tests.sh lustre s3` then runs the two remaining scenarios. |
+
+#### Measured (r5d.12xlarge, 48 vCPU, 384 GiB RAM, 2 x 900 GB NVMe in RAID0; FSx for Lustre SCRATCH_2 2,400 GiB, Lustre 2.15)
+
+Query: three complete bacterial genomes (85 KB, `-task megablast` default, `-evalue 1e-3
+-max_target_seqs 5`, 48 threads). DB: `nt` prefix `2026-10-06-01-05-02`, 3,557 files, 1,223 GB,
+131,965,472 sequences / 4.71 x 10^12 bases. Both scenarios read the same in-region S3 copy and
+produced identical results (19 rows, same hash). All times are wall-clock from the job logs.
+
+| Step | S3 -> NVMe | FSx for Lustre | Note |
+|---|---|---|---|
+| S3 copy from NCBI into the account's bucket (once per DB version) | - | **1,349 s** (22.5 min, 0.91 GB/s) | Server-side `aws s3 sync`, same region, m6i.large copy host. The `s3` scenario reads the same copy. |
+| `db_setup` inside the job | **2,773 s** (46.2 min, **441 MB/s**) | **3,767 s** (62.8 min, **0.33 GB/s**) | NVMe: `aws s3 sync` with `max_concurrent_requests 64`; NetworkIn was a flat 0.46 GB/s for 44 min, i.e. the CLI, not the 18.75 Gbit/s NIC, was the limit (the model above assumed 1-1.5 GB/s). Lustre: first-touch lazy load of every byte from S3 (`vmtouch -t`), bounded by the file system's S3 import rate. |
+| Cold `blastn` pass | **907 s** (15.1 min) | **8,360 s** (2 h 19 min, **9.2x**) | See the two-phase profile below. |
+| Second pass on the same node | **775 s** (12.9 min) | **8,374 s** (2 h 20 min) | nt (1.17 TB to cache) does not fit in 384 GiB, so the second pass is not a warm pass on either path: NVMe gains 15 %, Lustre nothing (the two passes differ by 14 s). |
+| Job total (setup + 2 passes) | **4,457 s** (74 min) | **20,505 s** (5 h 42 min) | |
+| Compute at list price (r5d.12xlarge $3.456/h) | **$4.3** | **$19.7** | Plus FSx 2,400 GiB for the hours it exists ($0.46/h) and the one-time copy host ($0.1). |
+
+**Where the Lustre time goes.** FSx CloudWatch (`DataReadBytes`, `DataReadOperations`, 5-min sums)
+shows the same shape in both passes: about 30 minutes of sequential reads at a steady **0.62 GB/s**
+(about 600 KB per operation, roughly 1.1 TB, the word-lookup scan over the `.nsq` volumes; above the
+469 MB/s SCRATCH_2 baseline, so burst credit was available), then **100 to 110 minutes of 8 KB random
+reads at 5,000 to 27,000 IOPS** (70 to 215 MB/s) with the 48 vCPUs at 7 to 11 % utilisation. A
+read-only look at the running process (SSM, `/proc`) during pass 1 explains the second phase:
+`blastn` memory-maps the volume files and had taken 138 million major page faults; the Lustre client
+caches at most `llite.max_cached_mb` = 191 GiB (50 % of RAM, default) and its extent locks age out
+after `ldlm.lru_max_age` = 600 s, so the pages touched by the hydration step and by the sequential
+scan are gone by the time the extension/traceback phase comes back for them, and every miss is one
+network round trip for one page. The NVMe path takes the same faults, but a local NVMe serves them in
+tens of microseconds at hundreds of thousands of IOPS, which is the whole 9x.
+
+What this means for the design choice:
+
+- For a DB that is larger than RAM, **FSx for Lustre is not a substitute for local NVMe as the
+  layer `blastn` reads from.** Its value is as the shared, persistent *source* (layer 1) that
+  many nodes can stage from without going back to S3; the per-node copy to NVMe (or a RAM-sized
+  DB) is still needed for the search itself. With that pattern, hydration and the sequential
+  phase would run at the file system's aggregate throughput, which scales with provisioned size
+  (`PerUnitStorageThroughput`/capacity), while the random phase stays local.
+- Mitigations on the Lustre client that we did not test here (candidates for a follow-up round,
+  not recommendations): raise `llite.*.max_cached_mb` towards the free RAM, raise
+  `ldlm.namespaces.*.lru_max_age`, pin the hot volumes with `vmtouch -l` when the DB (or a
+  subset such as `core_nt`, 301 GB) fits in RAM, or move the random-access phase to a local copy.
+- The 441 MB/s download is a CLI setting, not a hardware limit: `max_concurrent_requests` higher
+  than 64, `s5cmd`, or several `sync` processes over disjoint file ranges would cut the 46-minute
+  staging step; the 18.75 Gbit/s NIC allows about 2.3 GB/s.
+- Pass 2 being only 15 % faster on NVMe confirms the model's "warm pass = cold pass" assumption
+  for nt on a 384 GiB node. Only a bigger node (x2idn/x2iedn, 1-2 TiB RAM) or `core_nt` gets a true
+  warm pass.
+
+Evidence kept with the run: Batch job logs (`log_batch_s3.txt`, `log_batch_lustre.txt`), the copy
+host log, CloudWatch 5-min series (`cw_series.tsv`), `analyze_performance.py` output, and the
+`/proc` + `lctl get_param` probe of the Lustre client (`lustre_cache_probe.txt`). Billed cost of the
+round: to be read from Cost Explorer once the day has closed; list-price estimate about **$30**
+(Batch ~$25, FSx ~$3.5, NAT/S3/EIP under $1), EFS scenario excluded.
 
 ## Project structure
 

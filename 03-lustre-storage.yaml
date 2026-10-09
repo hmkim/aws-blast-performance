@@ -237,8 +237,13 @@ Resources:
           if [ "$REGION" = "$SRC_REGION" ]; then
             # Same region: server-side copy. No bytes pass through this host and the S3 gateway
             # endpoint makes it free of NAT charges.
+            # --copy-props none: for objects above the 8 MiB multipart threshold the CLI otherwise
+            # calls GetObjectTagging on the source to replicate its tags. The copy host's role grants
+            # only GetObject/ListBucket on the NCBI bucket (least privilege, finding #11), so every
+            # nt volume file failed with AccessDenied while the small files copied. Tags and user
+            # metadata are not needed here, and skipping them saves one request per object.
             echo "$(date -u +%FT%TZ) server-side copy $DB from $SRC to $DEST"
-            aws s3 sync $SRC $DEST --region $REGION --only-show-errors \
+            aws s3 sync $SRC $DEST --region $REGION --only-show-errors --copy-props none \
               --exclude "*" --include "$DB.*" --include "$DB-nucl-metadata.json" --include "taxdb.*"
           else
             # Other region: a server-side CopyObject whose source is in another region is rejected
