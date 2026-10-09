@@ -321,13 +321,14 @@ throughput; they show that the pipeline runs and that the three paths read the s
 ### nt round (2026-10-09, us-east-1, `nt`, 1,223 GB, `lustre` and `s3` scenarios)
 
 Run in the NCBI bucket's own region once the account's Elastic IP quota had been raised, with the
-`efs` scenario left out (`EnableEfsScenario=false`, see "Why three methods"). Two more defects
-appeared only at this size and in this region:
+`efs` scenario left out (`EnableEfsScenario=false`, see "Why three methods"). Three more defects
+appeared only at this size and in this region (the third at teardown):
 
 | # | What happened | Cause | Fix in this repository |
 |---|---|---|---|
 | 21 | Same-region Lustre copy host: `GetObjectTagging ... AccessDenied` for every `nt.*` volume file; the 2,686 small files (3.3 GB) copied, the database did not. Signal `failed:nt:...:43s`, host stopped itself (#14 worked). | Above the 8 MiB multipart threshold `aws s3 sync` replicates the source object's tags with `GetObjectTagging`. The copy host's role grants only `GetObject`/`ListBucket` on the NCBI bucket (#11, least privilege), so every large object failed. The cross-region path (#13) streams bytes and never calls it, which is why the smoke test in ap-northeast-2 did not show this. | `03`: `--copy-props none` on the server-side `sync` (tags and user metadata are not needed; one request per object saved). Verified on a 3 GB volume file: 17 s server-side. |
 | 22 | The Batch stack could not be deployed without the EFS stack (hard `!ImportValue` of the EFS file-system id), although the README tells you to skip `efs` for nt. | - | `04`: `EnableEfsScenario` parameter (`true` default) with a `Condition` on the EFS compute environment, queue, job definition, log group and outputs. `./run_tests.sh lustre s3` then runs the two remaining scenarios. |
+| 23 | Teardown: the Lustre stack ended in `DELETE_FAILED` (`The bucket you tried to delete is not empty`) with the 1.2 TB copy still in it, and the staging hosts' SSM status parameters survived every stack. `cleanup.sh` would not have helped: it derived the Lustre bucket name from an environment prefix instead of the stack, and never touched SSM. | CloudFormation does not empty buckets; the status parameters are written by user data, outside any stack. | `cleanup.sh`: reads the bucket's physical id from the stack before deleting it, empties and removes both buckets first, deletes `/<project>/efs/db-staging-status` and `/<project>/lustre/db-s3-copy-status`, then deletes the stacks. |
 
 #### Measured (r5d.12xlarge, 48 vCPU, 384 GiB RAM, 2 x 900 GB NVMe in RAID0; FSx for Lustre SCRATCH_2 2,400 GiB, Lustre 2.15)
 
