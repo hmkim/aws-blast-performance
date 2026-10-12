@@ -8,14 +8,19 @@ export AWS_REGION=us-east-1
 export PROJECT_NAME=blast-perf-test
 export BLAST_DB=nt                 # or ref_viruses_rep_genomes / 16S_ribosomal_RNA for a smoke test
 export LUSTRE_GIB=2400             # 1200 is enough for small DBs; nt needs 2400
+export COST_TAGS="Project=BLAST"   # stack tag for Cost Explorer; 04-batch's ProjectTag must carry the same value
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ```
+
+Pass `--tags $COST_TAGS` to every `deploy` below. Stack tags reach the staging hosts, EFS, FSx and
+NAT, but not the instances AWS Batch launches: those get the `Project` tag from the Batch stack's
+`ProjectTag` parameter (default `BLAST`), which is why the two must agree.
 
 ## 1. Network (5 min)
 
 ```bash
 aws cloudformation deploy --stack-name ${PROJECT_NAME}-network \
-  --template-file 01-network-infrastructure.yaml \
+  --template-file 01-network-infrastructure.yaml --tags $COST_TAGS \
   --parameter-overrides ProjectName=$PROJECT_NAME --region $AWS_REGION
 ```
 
@@ -23,7 +28,7 @@ aws cloudformation deploy --stack-name ${PROJECT_NAME}-network \
 
 ```bash
 aws cloudformation deploy --stack-name ${PROJECT_NAME}-efs \
-  --template-file 02-efs-storage.yaml --capabilities CAPABILITY_IAM \
+  --template-file 02-efs-storage.yaml --capabilities CAPABILITY_IAM --tags $COST_TAGS \
   --parameter-overrides ProjectName=$PROJECT_NAME BlastDbName=$BLAST_DB --region $AWS_REGION
 
 # progress
@@ -38,7 +43,7 @@ The staging host stops itself when finished.
 
 ```bash
 aws cloudformation deploy --stack-name ${PROJECT_NAME}-lustre \
-  --template-file 03-lustre-storage.yaml --capabilities CAPABILITY_IAM \
+  --template-file 03-lustre-storage.yaml --capabilities CAPABILITY_IAM --tags $COST_TAGS \
   --parameter-overrides ProjectName=$PROJECT_NAME BlastDbName=$BLAST_DB \
     S3BucketName=blast-nt-lustre LustreStorageCapacity=$LUSTRE_GIB --region $AWS_REGION
 
@@ -61,8 +66,8 @@ LUSTRE_MOUNT=$(aws cloudformation describe-stacks --stack-name ${PROJECT_NAME}-l
   --query 'Stacks[0].Outputs[?OutputKey==`LustreMountName`].OutputValue' --output text)
 
 aws cloudformation deploy --stack-name ${PROJECT_NAME}-batch \
-  --template-file 04-batch-environment.yaml --capabilities CAPABILITY_IAM \
-  --parameter-overrides ProjectName=$PROJECT_NAME BlastDbName=$BLAST_DB \
+  --template-file 04-batch-environment.yaml --capabilities CAPABILITY_IAM --tags $COST_TAGS \
+  --parameter-overrides ProjectName=$PROJECT_NAME BlastDbName=$BLAST_DB ProjectTag=${COST_TAGS#Project=} \
     QueryS3Bucket=$QUERY_BUCKET LustreFileSystemId=$LUSTRE_FS_ID LustreMountName=$LUSTRE_MOUNT \
   --region $AWS_REGION
 ```

@@ -225,8 +225,10 @@ r6id.4xlarge / r5d.4xlarge (16 vCPU, 128 GiB, local NVMe, about $1.2 / $1.15 per
 reports as available on a 128 GiB instance. With `MaxvCpus: 384` unchanged, `--concurrency` can go up
 to 24 jobs per queue. Staging takes minutes instead of hours (EFS writes about $1.6, Lustre
 hydration a few seconds), the three jobs run in well under an hour, and a complete round (deploy,
-stage, three scenarios, tear down the same day) costs about **$10**, dominated by the FSx 1,200 GiB
-hour-rounded charge and the NAT Gateway hours. This is the configuration in which EFS is a
+stage, three scenarios, tear down the same day) was **billed $8.2** in ap-northeast-2, of which
+$3.4 was NAT data processing for pulling the DB across regions three times and $2.5 was EFS data
+access; the compute itself was $1.1 (see "What the two measured rounds were billed"). This is the
+configuration in which EFS is a
 legitimate contender, and the one to use to compare EFS $/job against the other two.
 
 ## Cost
@@ -252,9 +254,31 @@ services are priced, and per day because that is how long you should keep them.
 One complete round (deploy, stage, three jobs, tear down inside 24 h) is roughly **$150-200**,
 of which EFS staging writes + two EFS cold passes are about $140 (running the `efs` scenario only
 with `core_nt` or the small-DB variant, as recommended above, brings a round to roughly $60; the
-measured `lustre` + `s3` round of 2026-10-09 came to about $30 at list price, 7 h end to end). Leaving everything up costs
+`lustre` + `s3` round of 2026-10-09 was **billed $28.9**, 7 h end to end, see below). Leaving everything up costs
 about **$760 per month** plus any staging instance you forget to stop (the templates now stop them
 automatically; the original r5d.24xlarge staging hosts would have cost $5,000 per month each).
+
+### What the two measured rounds were billed (Cost Explorer, read 2026-10-12)
+
+| Item | Small-DB round, ap-northeast-2, 2026-10-08 (smoke 346 MB + `ref_prok_rep_genomes` 26.9 GB, 3 scenarios) | nt round, us-east-1, 2026-10-09 (`lustre` + `s3`, no EFS) |
+|---|---|---|
+| Batch compute | r5d.4xlarge 0.80 h, **$1.11** | r5d.12xlarge 7.04 h, **$24.34** (lustre job 5.75 h $19.88, s3 job 1.29 h $4.46) |
+| NAT Gateway data processing | 57 GB, **$3.39** (every DB pull crossed regions through the NAT) | 0.8 GB, $0.04 (the 1.2 TB pull went through the S3 gateway endpoint) |
+| NAT Gateway hours | 4 h, $0.24 | 8 h, $0.36 |
+| EFS Elastic throughput data access | 51 GB, **$2.53** (staging writes + one cold read; 2.3x the EFS job's compute) | not deployed |
+| FSx for Lustre SCRATCH_2 | 1,200 GiB x 2.5 h, $0.68 | 2,400 GiB x 6.4 h, $2.93 |
+| S3 requests | $0.02 | **$0.83** (151k multipart PUTs for the 1.2 TB server-side copy, 196k GETs) |
+| Staging / copy hosts (m6i) | $0.20 | $0.04 |
+| EBS root volumes of Batch instances | within noise | $0.34 |
+| **Total** | **$8.2** | **$28.9** |
+
+Two things the bill says that the price list did not. First, running a round outside the NCBI
+bucket's region makes NAT data processing the largest line item ($3.39 of $8.2, more than the
+compute); at nt scale the same effect would have been about $210, which is why the nt round moved
+to us-east-1. Second, the Batch instances (86% of the nt round) did not carry the stack-level
+`Project` tag and were only recoverable through the `Name` tag that the compute environments set.
+`04-batch-environment.yaml` now writes `Project` onto the instances (`ProjectTag` parameter) and onto
+the launch-template volumes; QUICKSTART passes the same value as the stack tag.
 
 ### What an earlier round actually cost
 
@@ -321,14 +345,15 @@ throughput; they show that the pipeline runs and that the three paths read the s
 ### nt round (2026-10-09, us-east-1, `nt`, 1,223 GB, `lustre` and `s3` scenarios)
 
 Run in the NCBI bucket's own region once the account's Elastic IP quota had been raised, with the
-`efs` scenario left out (`EnableEfsScenario=false`, see "Why three methods"). Three more defects
-appeared only at this size and in this region (the third at teardown):
+`efs` scenario left out (`EnableEfsScenario=false`, see "Why three methods"). Four more defects
+appeared only at this size and in this region (the third at teardown, the fourth in the bill):
 
 | # | What happened | Cause | Fix in this repository |
 |---|---|---|---|
 | 21 | Same-region Lustre copy host: `GetObjectTagging ... AccessDenied` for every `nt.*` volume file; the 2,686 small files (3.3 GB) copied, the database did not. Signal `failed:nt:...:43s`, host stopped itself (#14 worked). | Above the 8 MiB multipart threshold `aws s3 sync` replicates the source object's tags with `GetObjectTagging`. The copy host's role grants only `GetObject`/`ListBucket` on the NCBI bucket (#11, least privilege), so every large object failed. The cross-region path (#13) streams bytes and never calls it, which is why the smoke test in ap-northeast-2 did not show this. | `03`: `--copy-props none` on the server-side `sync` (tags and user metadata are not needed; one request per object saved). Verified on a 3 GB volume file: 17 s server-side. |
 | 22 | The Batch stack could not be deployed without the EFS stack (hard `!ImportValue` of the EFS file-system id), although the README tells you to skip `efs` for nt. | - | `04`: `EnableEfsScenario` parameter (`true` default) with a `Condition` on the EFS compute environment, queue, job definition, log group and outputs. `./run_tests.sh lustre s3` then runs the two remaining scenarios. |
 | 23 | Teardown: the Lustre stack ended in `DELETE_FAILED` (`The bucket you tried to delete is not empty`) with the 1.2 TB copy still in it, and the staging hosts' SSM status parameters survived every stack. `cleanup.sh` would not have helped: it derived the Lustre bucket name from an environment prefix instead of the stack, and never touched SSM. | CloudFormation does not empty buckets; the status parameters are written by user data, outside any stack. | `cleanup.sh`: reads the bucket's physical id from the stack before deleting it, empties and removes both buckets first, deletes `/<project>/efs/db-staging-status` and `/<project>/lustre/db-s3-copy-status`, then deletes the stacks. |
+| 24 | Billing (found three days later in Cost Explorer): a `Project` tag filter returned $4.2 for the nt round; the $24.3 of Batch instances, 86% of the round, was missing and had to be recovered through the `Name` tag. | Stack-level `--tags` reach the resources CloudFormation creates, not the EC2 instances AWS Batch launches; those get `ComputeResources.Tags`, which set `Name` and a lowercase `project=<ProjectName>`. Cost Explorer tag keys are case-sensitive and only activated cost-allocation keys are visible. The instances' EBS root volumes carried no tag at all ($0.34). | `04`: `ProjectTag` parameter (default `BLAST`) written as `Project` into all three compute environments' tags and as `TagSpecifications` (volume) in both launch templates; QUICKSTART passes the same value as `--tags Project=...`. |
 
 #### Measured (r5d.12xlarge, 48 vCPU, 384 GiB RAM, 2 x 900 GB NVMe in RAID0; FSx for Lustre SCRATCH_2 2,400 GiB, Lustre 2.15)
 

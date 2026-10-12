@@ -6,6 +6,17 @@ Parameters:
     Type: String
     Default: blast-perf-test
 
+  ProjectTag:
+    Type: String
+    Default: BLAST
+    Description: >-
+      Value of the "Project" tag written onto the EC2 instances AWS Batch launches and onto the
+      EBS volumes of the launch-template scenarios. CloudFormation stack tags do not reach instances
+      Batch launches, and Cost Explorer tag keys are case-sensitive, so the lowercase "project" tag
+      below is not seen by a "Project" cost-allocation filter: in a measured round 86% of the cost
+      (the Batch instances) was invisible until recovered through the Name tag. Use the same value as
+      the --tags Project=... passed when deploying the stacks.
+
   BlastDbName:
     Type: String
     Default: nt
@@ -165,6 +176,15 @@ Resources:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateData:
+        # Batch tags the instances (ComputeResources.Tags); nothing tags their EBS volumes unless the
+        # launch template does, and untagged root volumes showed up as a separate line in billing.
+        TagSpecifications:
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub ${ProjectName}-lustre-compute
+              - Key: Project
+                Value: !Ref ProjectTag
         UserData:
           Fn::Base64: !Sub |
             MIME-Version: 1.0
@@ -192,6 +212,13 @@ Resources:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateData:
+        TagSpecifications:
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub ${ProjectName}-s3-compute
+              - Key: Project
+                Value: !Ref ProjectTag
         UserData:
           Fn::Base64: |
             MIME-Version: 1.0
@@ -249,6 +276,7 @@ Resources:
         InstanceRole: !GetAtt BatchInstanceProfile.Arn
         Tags:
           Name: !Sub ${ProjectName}-efs-compute
+          Project: !Ref ProjectTag
           project: !Ref ProjectName
           scenario: efs
 
@@ -379,6 +407,7 @@ Resources:
           Version: !GetAtt LustreLaunchTemplate.LatestVersionNumber
         Tags:
           Name: !Sub ${ProjectName}-lustre-compute
+          Project: !Ref ProjectTag
           project: !Ref ProjectName
           scenario: lustre
 
@@ -516,6 +545,7 @@ Resources:
           Version: !GetAtt NvmeLaunchTemplate.LatestVersionNumber
         Tags:
           Name: !Sub ${ProjectName}-s3-compute
+          Project: !Ref ProjectTag
           project: !Ref ProjectName
           scenario: s3-nvme
 
