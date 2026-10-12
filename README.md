@@ -105,7 +105,7 @@ download for NVMe).
 
 | Method | What it is the answer to | What the benchmark tells you | Known limits going in |
 |---|---|---|---|
-| **S3 -> local NVMe** (baseline) | "No shared storage at all": every instance stages its own copy. This is ElasticBLAST's model and the cheapest standing cost. | Per-instance staging time and MB/s; NVMe read throughput during the cold pass. Amortised over the jobs one instance serves (`.done` marker lets later jobs on the same instance skip the download). | Pays the full download on every new instance (and every Spot replacement); 1.2 TB at 18.75 Gbit/s is at least ~9 minutes. |
+| **S3 -> local NVMe** (baseline) | "No shared storage at all": every instance stages its own copy. This is ElasticBLAST's model and the cheapest standing cost. | Per-instance staging time and MB/s; NVMe read throughput during the cold pass. Amortised over the jobs one instance serves (`.done` marker lets later jobs on the same instance skip the download). | Pays the full download on every new instance (and every Spot replacement); 1.2 TB at the r5d.12xlarge NIC (12 Gbit/s) is at least ~14 minutes, and 46 minutes at the CLI default concurrency. |
 | **EFS** | "Simplest shared POSIX file system": no capacity planning, multi-AZ, mounted by ECS natively. | Whether a single NFS client's cap (1,500 MiB/s with efs-utils 2.x) and the Elastic-throughput read charge are acceptable for a streaming scan of the DB. | **Disqualified at nt scale by its price structure, before any measurement:** $0.03/GB read means every cold pass over nt costs about **$35** in EFS reads alone, and because nt (1,170 GB to cache) cannot stay in RAM on any R instance, *every* pass is cold; the per-client cap (about 1,500 MiB/s) puts a floor of about 12 min under a full scan, and adding nodes does not raise the per-node cap. Suited to DBs of tens of GB that are read into RAM once. |
 | **FSx for Lustre** | "Shared parallel file system for many concurrent nodes": HPC standard, S3-linked, no per-read charge, throughput scales with provisioned size. | Hydration time from S3 on first touch, then steady-state read throughput against many clients; whether 2,400 GiB SCRATCH_2 (about 470 MB/s baseline, bursts to about 3 GB/s) keeps up with a 48-thread blastn. | Single AZ; billed hourly for provisioned capacity whether used or not; a 1,200 GiB file system would be 93 % full with nt and too slow (234 MB/s baseline). |
 
@@ -157,7 +157,7 @@ by random 8 KB page faults over the network, not by sequential throughput. The c
 
 | Scenario | `db_setup` (fill layer 2) | Cold pass storage floor | Warm pass | Per cold pass storage cost |
 |---|---|---|---|---|
-| S3 -> NVMe | 1.2 TB download: >= ~9 min at 18.75 Gbit/s; ~13-20 min at a typical 1-1.5 GB/s `aws s3 sync` | NVMe RAID0, several GB/s: minutes | same as cold (nt > RAM) | $0 |
+| S3 -> NVMe | 1.2 TB download: >= ~14 min at the r5d.12xlarge NIC (12 Gbit/s, ~1.5 GB/s); ~46 min at the `aws s3 sync` default concurrency (measured) | NVMe RAID0, several GB/s: minutes | same as cold (nt > RAM) | $0 |
 | EFS | 0 (pre-staged) | >= 12.4 min at the 1,500 MiB/s client cap | same as cold | ~$35 (1,170 GB x $0.03) |
 | FSx for Lustre 2,400 GiB | lazy load from S3 on first touch (measured by the `vmtouch -t` hydration step) | ~6.4 min at burst (3,047 MB/s) to ~42 min at baseline (469 MB/s) | same as cold | $0 |
 
@@ -365,7 +365,7 @@ produced identical results (19 rows, same hash). All times are wall-clock from t
 | Step | S3 -> NVMe | FSx for Lustre | Note |
 |---|---|---|---|
 | S3 copy from NCBI into the account's bucket (once per DB version) | - | **1,349 s** (22.5 min, 0.91 GB/s) | Server-side `aws s3 sync`, same region, m6i.large copy host. The `s3` scenario reads the same copy. |
-| `db_setup` inside the job | **2,773 s** (46.2 min, **441 MB/s**) | **3,767 s** (62.8 min, **0.33 GB/s**) | NVMe: `aws s3 sync` with `max_concurrent_requests 64`; NetworkIn was a flat 0.46 GB/s for 44 min, i.e. the CLI, not the 18.75 Gbit/s NIC, was the limit (the model above assumed 1-1.5 GB/s). Lustre: first-touch lazy load of every byte from S3 (`vmtouch -t`), bounded by the file system's S3 import rate. |
+| `db_setup` inside the job | **2,773 s** (46.2 min, **441 MB/s**) | **3,767 s** (62.8 min, **0.33 GB/s**) | NVMe: `aws s3 sync` with `max_concurrent_requests 64`; NetworkIn was a flat 0.46 GB/s for 44 min, i.e. the CLI, not the 12 Gbit/s NIC (~1.5 GB/s), was the limit (the model above assumed 1-1.5 GB/s). Lustre: first-touch lazy load of every byte from S3 (`vmtouch -t`), bounded by the file system's S3 import rate. |
 | Cold `blastn` pass | **907 s** (15.1 min) | **8,360 s** (2 h 19 min, **9.2x**) | See the two-phase profile below. |
 | Second pass on the same node | **775 s** (12.9 min) | **8,374 s** (2 h 20 min) | nt (1.17 TB to cache) does not fit in 384 GiB, so the second pass is not a warm pass on either path: NVMe gains 15 %, Lustre nothing (the two passes differ by 14 s). |
 | Job total (setup + 2 passes) | **4,457 s** (74 min) | **20,505 s** (5 h 42 min) | |
@@ -398,7 +398,7 @@ What this means for the design choice:
   subset such as `core_nt`, 301 GB) fits in RAM, or move the random-access phase to a local copy.
 - The 441 MB/s download is a CLI setting, not a hardware limit: `max_concurrent_requests` higher
   than 64, `s5cmd`, or several `sync` processes over disjoint file ranges would cut the 46-minute
-  staging step; the 18.75 Gbit/s NIC allows about 2.3 GB/s.
+  staging step; the r5d.12xlarge NIC (12 Gbit/s) allows about 1.5 GB/s, and the December 2025 r5d.24xlarge runs reached 0.9-1.1 GB/s per node with ElasticBLAST's parallel download.
 - Pass 2 being only 15 % faster on NVMe confirms the model's "warm pass = cold pass" assumption
   for nt on a 384 GiB node. Only a bigger node (x2idn/x2iedn, 1-2 TiB RAM) or `core_nt` gets a true
   warm pass.
